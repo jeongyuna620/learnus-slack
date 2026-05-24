@@ -231,8 +231,8 @@ def main() -> None:
     events = get_upcoming_events(session, sesskey)
     print(f"이벤트 {len(events)}개 조회")
 
-    # 저녁 실행(18시 이후)에는 당일 마감도 포함
-    days_to_check = [1, 3] if now.hour < 18 else [0, 1, 3]
+    # 오전: 오늘·내일·3일 후 / 오후: 오늘만 (당일 두 번 알림)
+    days_to_check = [0, 1, 3] if now.hour < 18 else [0]
     events_by_days: dict[int, list] = {d: [] for d in days_to_check}
     for event in events:
         deadline = datetime.fromtimestamp(event["timesort"], tz=KST)
