@@ -87,19 +87,66 @@ def get_upcoming_events(session: requests.Session, sesskey: str) -> list:
         }
     ]
 
-    resp = session.post(
-        f"{LEARNUS_URL}/lib/ajax/service.php",
-        params={"sesskey": sesskey},
-        json=payload,
+    try:
+        resp = session.post(
+            f"{LEARNUS_URL}/lib/ajax/service.php",
+            params={"sesskey": sesskey},
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        result = data[0]
+
+        if not result.get("error"):
+            return result["data"]["events"]
+
+        exc = result.get("exception", {})
+        err_msg = exc.get("message") or exc.get("errorcode") or "unknown"
+        print(f"AJAX API 실패 ({err_msg}), HTML 스크래핑으로 전환")
+    except Exception as e:
+        print(f"AJAX 요청 실패: {e}, HTML 스크래핑으로 전환")
+
+    return _scrape_upcoming_events(session)
+
+
+def _scrape_upcoming_events(session: requests.Session) -> list:
+    resp = session.get(
+        f"{LEARNUS_URL}/calendar/view.php",
+        params={"view": "upcoming"},
         timeout=30,
     )
     resp.raise_for_status()
 
-    data = resp.json()
-    if data[0].get("error"):
-        raise RuntimeError(f"Calendar API 오류: {data[0]['error']}")
+    soup = BeautifulSoup(resp.text, "html.parser")
+    events = []
 
-    return data[0]["data"]["events"]
+    for div in soup.find_all("div", class_="event"):
+        starttime = div.get("data-event-starttime") or div.get("data-starttime")
+        if not starttime:
+            continue
+
+        name_el = div.find("h3", class_="name") or div.find(class_="name")
+        if not name_el:
+            continue
+
+        module = div.get("data-event-modulename") or div.get("data-modulename") or ""
+        url_el = name_el.find("a") or div.find("a")
+
+        course_el = div.find(class_="course-name") or div.find(attrs={"data-course-name": True})
+        course_name = ""
+        if course_el:
+            course_name = course_el.get_text(strip=True) or course_el.get("data-course-name", "")
+
+        events.append({
+            "name": name_el.get_text(strip=True),
+            "timesort": int(starttime),
+            "modulename": module,
+            "url": url_el["href"] if url_el and url_el.get("href") else None,
+            "course": {"fullname": course_name},
+        })
+
+    return events
 
 
 def build_slack_blocks(events_by_days: dict, today) -> list:
