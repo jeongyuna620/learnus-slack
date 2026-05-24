@@ -166,7 +166,12 @@ def build_slack_blocks(events_by_days: dict, today) -> list:
         if not events:
             continue
 
-        label = "🚨 *내일 마감!*" if days_left == 1 else f"⚠️ *{days_left}일 후 마감*"
+        if days_left == 0:
+            label = "🔥 *오늘 마감!*"
+        elif days_left == 1:
+            label = "🚨 *내일 마감!*"
+        else:
+            label = f"⚠️ *{days_left}일 후 마감*"
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": label}})
 
         for event in events:
@@ -226,7 +231,9 @@ def main() -> None:
     events = get_upcoming_events(session, sesskey)
     print(f"이벤트 {len(events)}개 조회")
 
-    events_by_days: dict[int, list] = {1: [], 3: []}
+    # 저녁 실행(18시 이후)에는 당일 마감도 포함
+    days_to_check = [1, 3] if now.hour < 18 else [0, 1, 3]
+    events_by_days: dict[int, list] = {d: [] for d in days_to_check}
     for event in events:
         deadline = datetime.fromtimestamp(event["timesort"], tz=KST)
         days_left = (deadline.date() - today).days

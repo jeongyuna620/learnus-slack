@@ -2,7 +2,8 @@ name: LearnUs Deadline Notifier
 
 on:
   schedule:
-    - cron: '0 0 * * *'   # 매일 오전 9시 KST (= UTC 00:00)
+    - cron: '0 0 * * *'    # 매일 오전 9시 KST (= UTC 00:00)
+    - cron: '0 12 * * *'   # 매일 오후 9시 KST (= UTC 12:00)
   workflow_dispatch:        # 수동 실행 버튼
 
 jobs:
