@@ -71,7 +71,7 @@ def get_upcoming_events(session: requests.Session, sesskey: str) -> list:
         payload = [{"index": 0,
                     "methodname": "core_calendar_get_action_events_by_timesort",
                     "args": {"timesortfrom": time_from, "timesortto": time_to,
-                             "limitnum": 100}}]
+                             "limitnum": 50}}]
         resp = session.post(
             f"{LEARNUS_URL}/lib/ajax/service.php",
             params={"sesskey": sesskey},
