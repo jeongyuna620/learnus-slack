@@ -41,30 +41,61 @@ def get_cookies_via_browser(username: str, password: str) -> dict:
     try:
         print(f"브라우저 로그인 시작: {LEARNUS_URL}/login.php")
         driver.get(f"{LEARNUS_URL}/login.php")
+        time.sleep(3)  # JS 렌더링 대기
+
+        print(f"현재 URL: {driver.current_url}")
+        print(f"페이지 제목: {driver.title}")
+
+        # 페이지 내 input 요소 전체 출력 (디버그)
+        inputs = driver.find_elements(By.TAG_NAME, "input")
+        print(f"input 요소 {len(inputs)}개:")
+        for inp in inputs:
+            print(f"  type={inp.get_attribute('type')} name={inp.get_attribute('name')} "
+                  f"id={inp.get_attribute('id')} placeholder={inp.get_attribute('placeholder')}")
 
         wait = WebDriverWait(driver, 20)
 
-        # 아이디 입력
-        user_el = wait.until(EC.presence_of_element_located(
-            (By.CSS_SELECTOR, "input[name='username'], input[id='username']")))
-        user_el.clear()
-        user_el.send_keys(username)
+        # 텍스트 입력 필드 중 첫 번째가 아이디, 두 번째가 비밀번호
+        text_inputs = [i for i in inputs
+                       if i.get_attribute("type") in ("text", "email", "tel", None, "")
+                       or i.get_attribute("name") in ("username", "userid", "id", "loginid")]
+        pwd_inputs  = [i for i in inputs if i.get_attribute("type") == "password"]
 
-        # 비밀번호 입력
-        pass_el = driver.find_element(
-            By.CSS_SELECTOR, "input[name='password'], input[type='password']")
-        pass_el.clear()
-        pass_el.send_keys(password)
+        if not text_inputs or not pwd_inputs:
+            # iframe 안에 있을 수 있음
+            iframes = driver.find_elements(By.TAG_NAME, "iframe")
+            print(f"iframe {len(iframes)}개 발견")
+            for iframe in iframes:
+                driver.switch_to.frame(iframe)
+                text_inputs = driver.find_elements(
+                    By.CSS_SELECTOR, "input[type='text'], input[name='username']")
+                pwd_inputs  = driver.find_elements(
+                    By.CSS_SELECTOR, "input[type='password']")
+                if text_inputs and pwd_inputs:
+                    print("iframe 안에서 폼 발견")
+                    break
+                driver.switch_to.default_content()
+
+        if not text_inputs:
+            raise RuntimeError("아이디 입력 필드를 찾을 수 없음")
+        if not pwd_inputs:
+            raise RuntimeError("비밀번호 입력 필드를 찾을 수 없음")
+
+        text_inputs[0].clear()
+        text_inputs[0].send_keys(username)
+        pwd_inputs[0].clear()
+        pwd_inputs[0].send_keys(password)
 
         # 로그인 버튼
-        submit_el = driver.find_element(
-            By.CSS_SELECTOR, "button[type='submit'], input[type='submit']")
+        try:
+            submit_el = driver.find_element(
+                By.CSS_SELECTOR, "button[type='submit'], input[type='submit'], button.btn-login, button.login-btn")
+        except Exception:
+            submit_el = driver.find_element(By.CSS_SELECTOR, "button, input[type='submit']")
         submit_el.click()
 
-        # 로그인 완료 대기 (login URL에서 벗어날 때까지)
-        wait.until(lambda d: "login" not in d.current_url.lower())
-        time.sleep(2)
-
+        # 로그인 완료 대기
+        time.sleep(5)
         print(f"로그인 후 URL: {driver.current_url}")
 
         # 쿠키 수집
