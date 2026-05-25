@@ -101,7 +101,9 @@ def get_upcoming_events(session: requests.Session, sesskey: str) -> list:
 
     # 방법 2: 강의 페이지 스크래핑 — 동영상(VOD) 마감일 추가
     courses = _get_enrolled_courses(session, sesskey, ajax_events)
-    vod_events = _get_vod_events(session, courses, dt_from, dt_to) if courses else []
+    completed = _get_completed_cmids(session, sesskey, list(courses.keys()))
+    vod_events = _get_vod_events(session, courses, dt_from, dt_to,
+                                  completed) if courses else []
 
     # AJAX 이벤트 URL 키 집합 (중복 방지)
     ajax_urls = {e.get("url", "") for e in ajax_events if e.get("url")}
@@ -295,9 +297,42 @@ def _extract_vod_deadline(text: str,
     return None, ""
 
 
+def _get_completed_cmids(session: requests.Session,
+                         sesskey: str,
+                         course_ids: list[str]) -> set[int]:
+    """core_completion_get_activities_completion_status로 완료된 활동 CMID 수집.
+    API 실패 시 빈 셋 반환 (필터링 없이 전체 표시)."""
+    completed: set[int] = set()
+    for cid in course_ids:
+        try:
+            payload = [{"index": 0,
+                        "methodname": "core_completion_get_activities_completion_status",
+                        "args": {"courseid": int(cid)}}]
+            resp = session.post(
+                f"{LEARNUS_URL}/lib/ajax/service.php",
+                params={"sesskey": sesskey},
+                json=payload,
+                headers={"Referer": f"{LEARNUS_URL}/my/",
+                         "X-Requested-With": "XMLHttpRequest"},
+                timeout=30,
+            )
+            data = resp.json()
+            if not isinstance(data, list) or data[0].get("error"):
+                break  # API 미지원 → 루프 중단
+            for stat in data[0].get("data", {}).get("statuses", []):
+                if stat.get("state", 0) >= 1:  # 1=완료, 2=통과
+                    completed.add(stat["cmid"])
+        except Exception:
+            break
+    if completed:
+        print(f"완료된 활동 {len(completed)}개 (VOD 알림 제외)")
+    return completed
+
+
 def _get_vod_events(session: requests.Session,
                     courses: dict[str, str],
-                    time_from: datetime, time_to: datetime) -> list:
+                    time_from: datetime, time_to: datetime,
+                    completed_cmids: "set[int] | None" = None) -> list:
     """강의 페이지(modtype_vod)에서 동영상 마감일 수집."""
     events: list = []
     seen_urls: set = set()
@@ -318,6 +353,11 @@ def _get_vod_events(session: requests.Session,
                 url = name_a.get("href", "")
                 if url in seen_urls:
                     continue
+                # 이미 시청 완료된 VOD 제외
+                if completed_cmids:
+                    m_cmid = re.search(r"\bid=(\d+)", url)
+                    if m_cmid and int(m_cmid.group(1)) in completed_cmids:
+                        continue
 
                 text = li.get_text(separator="|", strip=True)
                 dl, suffix = _extract_vod_deadline(text, time_from, time_to)
