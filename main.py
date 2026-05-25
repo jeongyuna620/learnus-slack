@@ -62,16 +62,33 @@ def login(username: str, password: str) -> requests.Session:
 # ──────────────────────────────────────────────
 
 def get_course_ids(session: requests.Session) -> list[str]:
-    resp = session.get(f"{LEARNUS_URL}/my/", timeout=30)
-    resp.raise_for_status()
-
     ids: set[str] = set()
-    for a in BeautifulSoup(resp.text, "html.parser").find_all(
-        "a", href=re.compile(r"/course/view\.php\?id=\d+")
-    ):
-        m = re.search(r"id=(\d+)", a["href"])
-        if m:
-            ids.add(m.group(1))
+
+    # 시도할 페이지 목록
+    pages = [
+        f"{LEARNUS_URL}/my/",
+        f"{LEARNUS_URL}/course/index.php",
+    ]
+
+    for page_url in pages:
+        resp = session.get(page_url, timeout=30)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # 페이지 내 모든 링크에서 course id 추출
+        all_hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
+        course_hrefs = [h for h in all_hrefs if "course" in h and "id=" in h]
+
+        # 디버그: 링크 샘플 출력
+        print(f"[{page_url}] 전체 링크 {len(all_hrefs)}개, course 관련 {len(course_hrefs)}개")
+        for h in course_hrefs[:10]:
+            print(f"  {h}")
+
+        for href in all_hrefs:
+            # /course/view.php?id=123 또는 유사 패턴
+            m = re.search(r"/course/view\.php[^\"']*[?&]id=(\d+)", href)
+            if m:
+                ids.add(m.group(1))
 
     print(f"수강 과목 {len(ids)}개 발견: {sorted(ids)}")
     return sorted(ids)
