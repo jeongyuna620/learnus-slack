@@ -234,41 +234,22 @@ def _extract_deadline_from_li(li) -> "datetime | None":
 def _extract_vod_deadline(text: str,
                            time_from: datetime,
                            time_to: datetime) -> "tuple[datetime | None, str]":
-    """LearnUS VOD 텍스트에서 마감일 파싱.
+    """LearnUS VOD 텍스트에서 정규 마감일만 파싱.
 
-    형식 예시:
-      2026-05-14 00:00:00 ~ 2026-05-25 23:59:59
-      (지각 : 2026-06-01 23:59:59)
-
-    반환: (deadline_datetime, suffix)
-      suffix = "" | " (지각)" — 지각 기한으로 처리된 경우
+    형식: YYYY-MM-DD HH:MM:SS ~ YYYY-MM-DD HH:MM:SS
+    → 범위 끝(~) 날짜를 정규 마감으로 사용.
+    지각 기한은 의도적으로 무시 (이미 시청한 영상의 지각 기한 오알림 방지).
     """
-    fmt = "%Y-%m-%d %H:%M:%S"
-
-    # 범위 끝 날짜 추출: ... ~ YYYY-MM-DD HH:MM:SS
-    main_dl: "datetime | None" = None
     m = re.search(
         r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s*~\s*"
         r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", text)
     if m:
         try:
-            main_dl = KST.localize(datetime.strptime(m.group(1), fmt))
+            dl = KST.localize(datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
+            if time_from <= dl <= time_to:
+                return dl, ""
         except ValueError:
             pass
-
-    # 지각 기한: (지각 : YYYY-MM-DD HH:MM:SS)
-    late_dl: "datetime | None" = None
-    m2 = re.search(r"지각\s*:\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", text)
-    if m2:
-        try:
-            late_dl = KST.localize(datetime.strptime(m2.group(1), fmt))
-        except ValueError:
-            pass
-
-    if main_dl and time_from <= main_dl <= time_to:
-        return main_dl, ""
-    if late_dl and time_from <= late_dl <= time_to:
-        return late_dl, " (지각)"
     return None, ""
 
 
