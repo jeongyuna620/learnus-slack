@@ -256,6 +256,20 @@ def _get_vod_events(session: requests.Session,
                 if m:
                     mod_types[m.group(1)] = mod_types.get(m.group(1), 0) + 1
             print(f"  [{cname}] 활동 {len(all_li)}개: {mod_types}")
+            # vod 샘플 HTML 출력 (첫 번째 vod 항목)
+            vod_samples = [li for li in all_li
+                           if "vod" in " ".join(li.get("class", []))]
+            if vod_samples:
+                sample = vod_samples[0]
+                print(f"  [{cname}] VOD 샘플 텍스트: {sample.get_text(separator='|', strip=True)[:300]}")
+                print(f"  [{cname}] VOD 샘플 속성: {dict(list(sample.attrs.items())[:6])}")
+                # 모든 data-* 속성 수집
+                data_attrs = {}
+                for el in sample.find_all(True):
+                    for k, v in el.attrs.items():
+                        if k.startswith("data-"):
+                            data_attrs[k] = v
+                print(f"  [{cname}] VOD data-* 속성: {data_attrs}")
 
             for li in all_li:
                 mod_class = " ".join(li.get("class", []))
@@ -293,6 +307,11 @@ def _get_vod_events(session: requests.Session,
                 soup2 = BeautifulSoup(resp2.text, "html.parser")
                 rows = soup2.find_all("tr")
                 print(f"  [{cname}] vod/index rows={len(rows)}")
+                # 첫 번째 데이터 행 텍스트 출력
+                data_rows = [r for r in rows if r.find("td")]
+                if data_rows:
+                    cells_text = [td.get_text(strip=True) for td in data_rows[0].find_all("td")]
+                    print(f"  [{cname}] vod/index 첫행 셀: {cells_text[:6]}")
                 for row in rows:
                     cells = row.find_all("td")
                     if len(cells) < 2:
