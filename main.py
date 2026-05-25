@@ -73,20 +73,9 @@ def get_sesskey(session: requests.Session) -> str:
     raise RuntimeError("sesskey를 찾을 수 없습니다. 로그인 상태를 확인하세요.")
 
 
-def get_upcoming_events(session: requests.Session, sesskey: str) -> list:
-    now = datetime.now(KST)
-    payload = [
-        {
-            "index": 0,
-            "methodname": "core_calendar_get_action_events_by_timesort",
-            "args": {
-                "timesortfrom": int(now.timestamp()),
-                "timesortto": int((now + timedelta(days=7)).timestamp()),
-                "limitnum": 100,
-            },
-        }
-    ]
-
+def _call_ajax(session: requests.Session, sesskey: str, methodname: str, args: dict) -> dict | None:
+    """Moodle AJAX 호출. 실패 시 None 반환."""
+    payload = [{"index": 0, "methodname": methodname, "args": args}]
     try:
         resp = session.post(
             f"{LEARNUS_URL}/lib/ajax/service.php",
@@ -97,17 +86,53 @@ def get_upcoming_events(session: requests.Session, sesskey: str) -> list:
         resp.raise_for_status()
         data = resp.json()
         result = data[0]
-
-        if not result.get("error"):
-            return result["data"]["events"]
-
-        exc = result.get("exception", {})
-        err_msg = exc.get("message") or exc.get("errorcode") or "unknown"
-        print(f"AJAX API 실패 ({err_msg}), HTML 스크래핑으로 전환")
+        if result.get("error"):
+            exc = result.get("exception", {})
+            msg = exc.get("message") or exc.get("errorcode") or str(result.get("error"))
+            print(f"  AJAX [{methodname}] 실패: {msg}")
+            return None
+        return result.get("data")
     except Exception as e:
-        print(f"AJAX 요청 실패: {e}, HTML 스크래핑으로 전환")
+        print(f"  AJAX [{methodname}] 예외: {e}")
+        return None
 
-    return _scrape_upcoming_events(session)
+
+def get_upcoming_events(session: requests.Session, sesskey: str) -> list:
+    now = datetime.now(KST)
+    # 오늘 자정(00:00 KST)부터 7일 후까지 — 오늘 마감 항목 누락 방지
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    time_from = int(today_start.timestamp())
+    time_to = int((today_start + timedelta(days=8)).timestamp())
+
+    # 방법 1: core_calendar_get_action_events_by_timesort
+    print("방법 1: core_calendar_get_action_events_by_timesort 시도")
+    data = _call_ajax(session, sesskey, "core_calendar_get_action_events_by_timesort", {
+        "timesortfrom": time_from,
+        "timesortto": time_to,
+        "limitnum": 100,
+    })
+    if data is not None:
+        events = data.get("events", [])
+        print(f"  → {len(events)}개 이벤트 수신")
+        return events
+
+    # 방법 2: block_myoverview_get_action_events_by_timesort
+    print("방법 2: block_myoverview_get_action_events_by_timesort 시도")
+    data = _call_ajax(session, sesskey, "block_myoverview_get_action_events_by_timesort", {
+        "timesortfrom": time_from,
+        "timesortto": time_to,
+        "limitnum": 100,
+    })
+    if data is not None:
+        events = data.get("events", [])
+        print(f"  → {len(events)}개 이벤트 수신")
+        return events
+
+    # 방법 3: HTML 스크래핑
+    print("방법 3: HTML 스크래핑 시도")
+    events = _scrape_upcoming_events(session)
+    print(f"  → {len(events)}개 이벤트 수신")
+    return events
 
 
 def _scrape_upcoming_events(session: requests.Session) -> list:
@@ -121,26 +146,66 @@ def _scrape_upcoming_events(session: requests.Session) -> list:
     soup = BeautifulSoup(resp.text, "html.parser")
     events = []
 
-    for div in soup.find_all("div", class_="event"):
-        starttime = div.get("data-event-starttime") or div.get("data-starttime")
+    # Moodle 3.x / 4.x / LearnUs 커스텀 테마 모두 커버
+    event_divs = (
+        soup.find_all("div", class_="event")
+        or soup.find_all("div", attrs={"data-event-id": True})
+    )
+    print(f"  HTML에서 .event 요소 {len(event_divs)}개 발견")
+
+    for div in event_divs:
+        # 타임스탬프
+        starttime = (
+            div.get("data-event-starttime")
+            or div.get("data-starttime")
+            or div.get("data-event-time")
+        )
+        if not starttime:
+            # 자식 요소에서 찾기
+            ts_el = div.find(attrs={"data-event-starttime": True}) or div.find(attrs={"data-starttime": True})
+            if ts_el:
+                starttime = ts_el.get("data-event-starttime") or ts_el.get("data-starttime")
         if not starttime:
             continue
 
-        name_el = div.find("h3", class_="name") or div.find(class_="name")
+        # 이벤트 이름
+        name_el = (
+            div.find("h3", class_="name")
+            or div.find(class_="name")
+            or div.find(class_="event-name")
+            or div.find("a", class_="event-name")
+        )
         if not name_el:
             continue
 
-        module = div.get("data-event-modulename") or div.get("data-modulename") or ""
-        url_el = name_el.find("a") or div.find("a")
+        module = (
+            div.get("data-event-modulename")
+            or div.get("data-modulename")
+            or div.get("data-event-component", "").replace("mod_", "")
+            or ""
+        )
 
-        course_el = div.find(class_="course-name") or div.find(attrs={"data-course-name": True})
+        url_el = name_el.find("a") if name_el.name != "a" else name_el
+        if not url_el:
+            url_el = div.find("a", href=re.compile(r"/mod/"))
+
         course_name = ""
+        course_el = (
+            div.find(class_="course-name")
+            or div.find(class_="col-11 event-name-container")
+            or div.find(attrs={"data-course-name": True})
+        )
         if course_el:
-            course_name = course_el.get_text(strip=True) or course_el.get("data-course-name", "")
+            course_name = course_el.get("data-course-name") or course_el.get_text(strip=True)
+
+        try:
+            ts = int(starttime)
+        except ValueError:
+            continue
 
         events.append({
             "name": name_el.get_text(strip=True),
-            "timesort": int(starttime),
+            "timesort": ts,
             "modulename": module,
             "url": url_el["href"] if url_el and url_el.get("href") else None,
             "course": {"fullname": course_name},
@@ -172,6 +237,7 @@ def build_slack_blocks(events_by_days: dict, today) -> list:
             label = "🚨 *내일 마감!*"
         else:
             label = f"⚠️ *{days_left}일 후 마감*"
+
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": label}})
 
         for event in events:
@@ -228,10 +294,18 @@ def main() -> None:
     print("로그인 성공")
 
     sesskey = get_sesskey(session)
-    events = get_upcoming_events(session, sesskey)
-    print(f"이벤트 {len(events)}개 조회")
+    print("sesskey 획득")
 
-    # 오전: 오늘·내일·3일 후 / 오후: 오늘만 (당일 두 번 알림)
+    events = get_upcoming_events(session, sesskey)
+
+    # 디버그: 조회된 전체 이벤트 출력
+    print(f"\n[전체 이벤트 목록 - {len(events)}개]")
+    for e in events:
+        dl = datetime.fromtimestamp(e["timesort"], tz=KST)
+        days_left = (dl.date() - today).days
+        print(f"  D{days_left:+d} | {dl.strftime('%m/%d %H:%M')} | {e.get('modulename','?'):8s} | {e['name']}")
+
+    # 오전: 오늘·내일·3일 후 / 오후: 오늘만
     days_to_check = [0, 1, 3] if now.hour < 18 else [0]
     events_by_days: dict[int, list] = {d: [] for d in days_to_check}
     for event in events:
@@ -243,12 +317,12 @@ def main() -> None:
     total = sum(len(v) for v in events_by_days.values())
 
     if total == 0:
-        print("1일/3일 후 마감 항목 없음 — 알림 생략")
+        print("\n알림 대상 없음 — 생략")
         return
 
     blocks = build_slack_blocks(events_by_days, today)
     send_slack(webhook_url, blocks)
-    print(f"Slack 알림 전송 완료 ({total}건)")
+    print(f"\nSlack 알림 전송 완료 ({total}건)")
 
 
 if __name__ == "__main__":
