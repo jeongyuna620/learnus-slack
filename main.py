@@ -35,6 +35,7 @@ def build_session(moodle_session: str) -> requests.Session:
 def check_session(session: requests.Session) -> bool:
     """세션이 유효한지 확인 (login 페이지로 리다이렉트되면 만료)."""
     resp = session.get(f"{LEARNUS_URL}/my/", timeout=30)
+    print(f"세션 확인 → 최종 URL: {resp.url}")
     if "login" in resp.url.lower():
         return False
     return True
