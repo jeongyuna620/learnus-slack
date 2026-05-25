@@ -153,11 +153,46 @@ def _discover_courses_from_calendar(session: requests.Session,
         return {}
 
 
+def _get_courses_from_grades(session: requests.Session,
+                             sesskey: str) -> dict[str, str]:
+    """gradereport_overview_get_course_grades AJAX로 수강 과목 수집."""
+    try:
+        payload = [{"index": 0,
+                    "methodname": "gradereport_overview_get_course_grades",
+                    "args": {"userid": 0}}]
+        resp = session.post(
+            f"{LEARNUS_URL}/lib/ajax/service.php",
+            params={"sesskey": sesskey},
+            json=payload,
+            headers={"Referer": f"{LEARNUS_URL}/my/",
+                     "X-Requested-With": "XMLHttpRequest"},
+            timeout=30,
+        )
+        data = resp.json()
+        if not isinstance(data, list) or data[0].get("error"):
+            err = (data[0].get("exception", {}) if isinstance(data, list) and data
+                   else data)
+            print(f"성적 AJAX 실패: {err}")
+            return {}
+        grades = data[0].get("data", {}).get("grades", [])
+        courses = {str(g["courseid"]): g.get("coursefullname", f"Course {g['courseid']}")
+                   for g in grades if g.get("courseid") and int(g["courseid"]) > 10}
+        print(f"성적 AJAX → 과목 {len(courses)}개: {list(courses.values())[:8]}")
+        return courses
+    except Exception as e:
+        print(f"성적 AJAX 예외: {e}")
+        return {}
+
+
 def _get_enrolled_courses(session: requests.Session, sesskey: str,
                           ajax_events: list | None = None) -> dict[str, str]:
     """수강 과목 목록 반환 {course_id: fullname}."""
     # ── 방법 A: 학기 전체 캘린더로 과목 ID 수집 ─────────────────
     courses = _discover_courses_from_calendar(session, sesskey)
+
+    # ── 방법 A2: 성적 개요 AJAX (캘린더에 없는 과목 보완) ─────────
+    for cid, cname in _get_courses_from_grades(session, sesskey).items():
+        courses.setdefault(cid, cname)
 
     # ── 방법 B: HTML 스크래핑 보완 ───────────────────────────────
     for cid, cname in _get_course_ids(session).items():
@@ -190,7 +225,6 @@ def _get_course_ids(session: requests.Session) -> dict[str, str]:
         try:
             resp = session.get(url, timeout=30)
             if "login" in resp.url.lower():
-                print(f"  [{url}] → login 리다이렉트, 건너뜀")
                 continue
             soup = BeautifulSoup(resp.text, "html.parser")
             before = len(courses)
@@ -200,7 +234,7 @@ def _get_course_ids(session: requests.Session) -> dict[str, str]:
                     name = a.get_text(strip=True)
                     if name:
                         courses[m.group(1)] = name
-            # grade/report/user 링크: 텍스트가 실제 과목명, id= 가 course ID
+            # grade/report/user 링크: 텍스트가 실제 과목명
             for a in soup.find_all("a", href=re.compile(r"grade/report/user")):
                 m = re.search(r"\bid=(\d+)", a["href"])
                 if m and int(m.group(1)) > 10:
@@ -208,8 +242,12 @@ def _get_course_ids(session: requests.Session) -> dict[str, str]:
                     if name and name.lower() not in _FAKE_COURSE_NAMES:
                         courses.setdefault(m.group(1), name)
             added = len(courses) - before
-            print(f"  [{url.split('/')[-2]+'/'+url.split('/')[-1]}] "
-                  f"→ {added}개 추가 (누적 {len(courses)}개)")
+            # 성적 개요 페이지에서 id=포함 링크 디버그 (아직 과목 못 찾은 경우)
+            if "grade/report/overview" in url and added == 0:
+                id_links = [(a.get("href", "")[-60:], a.get_text(strip=True)[:20])
+                            for a in soup.find_all("a", href=re.compile(r"id=\d+"))
+                            if int(re.search(r"id=(\d+)", a.get("href","") or "0").group(1) if re.search(r"id=(\d+)", a.get("href","")) else "0") > 10]
+                print(f"  [grade/overview] id=링크 샘플: {id_links[:8]}")
         except Exception as e:
             print(f"  과목 스크래핑 실패 [{url}]: {e}")
     return courses
