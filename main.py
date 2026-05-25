@@ -11,14 +11,11 @@ LEARNUS_URL = "https://ys.learnus.org"
 
 MODULE_EMOJI = {
     "assign": "📝",
-    "quiz": "📊",
-    "vod": "🎥",
-    "zoom": "💻",
-    "attendance": "✅",
-    "forum": "💬",
-    "data": "📋",
-    "mod_assign": "📝",
-    "mod_quiz": "📊",
+    "quiz":   "📊",
+    "vod":    "🎥",
+    "zoom":   "💻",
+    "data":   "📋",
+    "forum":  "💬",
 }
 
 WEEKDAY_KO = ["월", "화", "수", "목", "금", "토", "일"]
@@ -35,7 +32,8 @@ def login(username: str, password: str) -> requests.Session:
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0.0.0 Safari/537.36"
-        )
+        ),
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
     })
 
     resp = session.get(f"{LEARNUS_URL}/login/index.php", timeout=30)
@@ -47,12 +45,8 @@ def login(username: str, password: str) -> requests.Session:
 
     resp = session.post(
         f"{LEARNUS_URL}/login/index.php",
-        data={
-            "username": username,
-            "password": password,
-            "logintoken": logintoken,
-            "anchor": "",
-        },
+        data={"username": username, "password": password,
+              "logintoken": logintoken, "anchor": ""},
         timeout=30,
     )
     resp.raise_for_status()
@@ -63,183 +57,193 @@ def login(username: str, password: str) -> requests.Session:
     return session
 
 
-def get_sesskey(session: requests.Session) -> str:
+# ──────────────────────────────────────────────
+# 수강 과목 목록 수집
+# ──────────────────────────────────────────────
+
+def get_course_ids(session: requests.Session) -> list[str]:
     resp = session.get(f"{LEARNUS_URL}/my/", timeout=30)
     resp.raise_for_status()
 
-    match = re.search(r'"sesskey"\s*:\s*"([a-zA-Z0-9]+)"', resp.text)
-    if match:
-        return match.group(1)
+    ids: set[str] = set()
+    for a in BeautifulSoup(resp.text, "html.parser").find_all(
+        "a", href=re.compile(r"/course/view\.php\?id=\d+")
+    ):
+        m = re.search(r"id=(\d+)", a["href"])
+        if m:
+            ids.add(m.group(1))
+
+    print(f"수강 과목 {len(ids)}개 발견: {sorted(ids)}")
+    return sorted(ids)
+
+
+# ──────────────────────────────────────────────
+# 날짜 파싱 헬퍼
+# ──────────────────────────────────────────────
+
+_KO_MONTHS = {
+    "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6,
+    "7": 7, "8": 8, "9": 9, "10": 10, "11": 11, "12": 12,
+}
+_EN_MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "may": 5, "june": 6, "july": 7, "august": 8,
+    "september": 9, "october": 10, "november": 11, "december": 12,
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4,
+    "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def parse_deadline(text: str) -> datetime | None:
+    """마감일 텍스트를 KST datetime으로 변환."""
+    text = text.strip()
+    if not text or text == "-":
+        return None
+
+    # 1) data-timestamp 같은 숫자가 텍스트로 노출된 경우
+    if re.fullmatch(r"\d{10,}", text):
+        return datetime.fromtimestamp(int(text), tz=KST)
+
+    # 2) 한국어: "2026년 5월 25일 (일) 오후 11:59"
+    m = re.search(
+        r"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일"
+        r"(?:[^\d]*)?(오전|오후)?\s*(\d{1,2}):(\d{2})",
+        text,
+    )
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        ampm, h, mi = m.group(4), int(m.group(5)), int(m.group(6))
+        if ampm == "오후" and h != 12:
+            h += 12
+        elif ampm == "오전" and h == 12:
+            h = 0
+        try:
+            return KST.localize(datetime(y, mo, d, h, mi))
+        except ValueError:
+            pass
+
+    # 3) 영어: "25 May 2026, 11:59 PM" / "Monday, 25 May 2026, 11:59 PM"
+    m = re.search(
+        r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4}),?\s+(\d{1,2}):(\d{2})(?:\s*(AM|PM))?",
+        text, re.IGNORECASE,
+    )
+    if m:
+        d, mon_s, y = int(m.group(1)), m.group(2).lower(), int(m.group(3))
+        h, mi = int(m.group(4)), int(m.group(5))
+        ampm = (m.group(6) or "").upper()
+        mo = _EN_MONTHS.get(mon_s)
+        if mo:
+            if ampm == "PM" and h != 12:
+                h += 12
+            elif ampm == "AM" and h == 12:
+                h = 0
+            try:
+                return KST.localize(datetime(y, mo, d, h, mi))
+            except ValueError:
+                pass
+
+    return None
+
+
+# ──────────────────────────────────────────────
+# 과목별 과제/퀴즈 마감일 수집
+# ──────────────────────────────────────────────
+
+def get_module_events(session: requests.Session, course_id: str,
+                      module: str, course_name: str,
+                      time_from: datetime, time_to: datetime) -> list:
+    """
+    /mod/<module>/index.php?id=COURSE_ID 페이지에서
+    마감일이 있는 활동을 파싱한다.
+    """
+    url = f"{LEARNUS_URL}/mod/{module}/index.php"
+    try:
+        resp = session.get(url, params={"id": course_id}, timeout=20)
+        if resp.status_code != 200:
+            return []
+    except Exception as e:
+        print(f"  [{module}] {course_id} 요청 실패: {e}")
+        return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    el = soup.find("input", {"name": "sesskey"})
-    if el:
-        return el["value"]
+    events = []
 
-    raise RuntimeError("sesskey를 찾을 수 없습니다.")
+    # 테이블의 모든 행 순회
+    for row in soup.find_all("tr"):
+        cells = row.find_all("td")
+        if len(cells) < 2:
+            continue
 
+        # 이름 셀 (첫 번째 <a> 링크)
+        name_a = cells[0].find("a")
+        if not name_a:
+            continue
+        name = name_a.get_text(strip=True)
+        act_url = name_a.get("href", "")
 
-# ──────────────────────────────────────────────
-# 이벤트 조회 — 3단계 폴백
-# ──────────────────────────────────────────────
+        # 타임스탬프 속성이 있으면 우선 사용
+        ts_el = row.find(attrs={"data-timedue": True}) \
+               or row.find(attrs={"data-timestamp": True})
+        if ts_el:
+            ts = int(ts_el.get("data-timedue") or ts_el.get("data-timestamp"))
+            deadline = datetime.fromtimestamp(ts, tz=KST)
+        else:
+            # 날짜가 들어있을 법한 셀 순서대로 파싱 시도
+            deadline = None
+            for cell in cells[1:]:
+                deadline = parse_deadline(cell.get_text(strip=True))
+                if deadline:
+                    break
 
-def get_upcoming_events(session: requests.Session, sesskey: str) -> list:
-    # 방법 1: AJAX (Referer 헤더 포함)
-    print("방법 1: AJAX API 시도")
-    events = _get_events_via_ajax(session, sesskey)
-    if events is not None:
-        print(f"  → {len(events)}개 이벤트 수신")
-        return events
+        if not deadline:
+            continue
 
-    # 방법 2: iCal 내보내기 (JS 불필요, 가장 안정적)
-    print("방법 2: iCal 내보내기 시도")
-    events = _get_events_via_ical(session)
-    if events is not None:
-        print(f"  → {len(events)}개 이벤트 수신")
-        return events
-
-    print("모든 방법 실패 — 이벤트 없음")
-    return []
-
-
-def _get_events_via_ajax(session: requests.Session, sesskey: str) -> list | None:
-    now = datetime.now(KST)
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    payload = [{
-        "index": 0,
-        "methodname": "core_calendar_get_action_events_by_timesort",
-        "args": {
-            "timesortfrom": int(today_start.timestamp()),
-            "timesortto": int((today_start + timedelta(days=8)).timestamp()),
-            "limitnum": 100,
-        },
-    }]
-    try:
-        resp = session.post(
-            f"{LEARNUS_URL}/lib/ajax/service.php",
-            params={"sesskey": sesskey},
-            json=payload,
-            headers={
-                "Referer": f"{LEARNUS_URL}/my/",
-                "X-Requested-With": "XMLHttpRequest",
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        result = data[0]
-        if result.get("error"):
-            exc = result.get("exception", {})
-            msg = exc.get("message") or exc.get("errorcode") or str(result.get("error"))
-            print(f"  AJAX 오류: {msg}")
-            return None
-        return result["data"]["events"]
-    except Exception as e:
-        print(f"  AJAX 예외: {e}")
-        return None
-
-
-def _get_events_via_ical(session: requests.Session) -> list | None:
-    try:
-        # export form에서 userid / authtoken 추출
-        resp = session.get(f"{LEARNUS_URL}/calendar/export.php", timeout=30)
-        resp.raise_for_status()
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        form = soup.find("form", action=re.compile(r"export_execute")) or soup.find("form")
-        if not form:
-            print("  iCal: export form 없음")
-            return None
-
-        form_data: dict = {}
-        for inp in form.find_all("input"):
-            name = inp.get("name")
-            if name:
-                form_data[name] = inp.get("value", "")
-        for sel in form.find_all("select"):
-            name = sel.get("name")
-            if not name:
-                continue
-            selected = sel.find("option", selected=True)
-            form_data[name] = selected["value"] if selected else ""
-
-        # 액션 이벤트(과제·퀴즈 등) + 최근/예정 기간
-        if "preset_what" in form_data:
-            form_data["preset_what"] = "actionevents"
-        if "preset_time" in form_data:
-            form_data["preset_time"] = "recentupcoming"
-
-        action = form.get("action", f"{LEARNUS_URL}/calendar/export_execute.php")
-        if not action.startswith("http"):
-            action = LEARNUS_URL + action
-
-        resp = session.post(action, data=form_data, timeout=30)
-        resp.raise_for_status()
-
-        body = resp.text
-        if not body.strip().startswith("BEGIN:VCALENDAR"):
-            print(f"  iCal: 예상치 못한 응답 (앞부분: {body[:80]!r})")
-            return None
-
-        return _parse_ical(body)
-    except Exception as e:
-        print(f"  iCal 예외: {e}")
-        return None
-
-
-def _parse_ical(ical_text: str) -> list:
-    """VCALENDAR 텍스트를 파싱해 이벤트 리스트 반환."""
-    # 긴 줄 이어붙이기 (RFC 5545 line folding)
-    unfolded = re.sub(r"\r?\n[ \t]", "", ical_text)
-
-    events: list = []
-    current: dict = {}
-    in_event = False
-
-    for line in unfolded.splitlines():
-        if line == "BEGIN:VEVENT":
-            in_event = True
-            current = {}
-        elif line == "END:VEVENT":
-            in_event = False
-            if "timesort" in current and "name" in current:
-                events.append(current)
-        elif in_event and ":" in line:
-            key_raw, _, val = line.partition(":")
-            key = key_raw.split(";")[0].upper()
-
-            if key == "DTSTART":
-                val = val.strip()
-                try:
-                    if val.endswith("Z"):
-                        dt = datetime.strptime(val, "%Y%m%dT%H%M%SZ")
-                        dt = pytz.utc.localize(dt).astimezone(KST)
-                    elif "T" in val:
-                        dt = KST.localize(datetime.strptime(val[:15], "%Y%m%dT%H%M%S"))
-                    else:
-                        dt = KST.localize(datetime.strptime(val[:8], "%Y%m%d"))
-                    current["timesort"] = int(dt.timestamp())
-                except Exception as e:
-                    print(f"  DTSTART 파싱 오류: {e} (값: {val})")
-
-            elif key == "SUMMARY":
-                # "Assignment: 제목" → "제목" 으로 정리
-                name = val.strip()
-                name = re.sub(r"^(Assignment|Quiz|Attendance|Forum)\s*:\s*", "", name, flags=re.IGNORECASE)
-                current["name"] = name
-
-            elif key == "URL":
-                current["url"] = val.strip()
-
-            elif key == "CATEGORIES":
-                module = val.strip().lower().replace("mod_", "")
-                current["modulename"] = module
-
-            elif key == "DESCRIPTION":
-                desc = val.replace("\\n", "\n").replace("\\,", ",").strip()
-                current.setdefault("course", {"fullname": desc.split("\n")[0]})
+        # 조회 범위 내인지 확인
+        dl_aware = deadline if deadline.tzinfo else KST.localize(deadline)
+        if time_from <= dl_aware <= time_to:
+            events.append({
+                "name": name,
+                "timesort": int(dl_aware.timestamp()),
+                "modulename": module,
+                "url": act_url,
+                "course": {"fullname": course_name},
+            })
 
     return events
+
+
+def get_upcoming_events(session: requests.Session) -> list:
+    now = datetime.now(KST)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    time_from = today_start
+    time_to = today_start + timedelta(days=8)
+
+    course_ids = get_course_ids(session)
+    if not course_ids:
+        print("수강 과목을 찾지 못했습니다.")
+        return []
+
+    # 과목 이름 수집 (대시보드 링크 텍스트)
+    resp = session.get(f"{LEARNUS_URL}/my/", timeout=30)
+    soup = BeautifulSoup(resp.text, "html.parser")
+    course_names: dict[str, str] = {}
+    for a in soup.find_all("a", href=re.compile(r"/course/view\.php\?id=\d+")):
+        m = re.search(r"id=(\d+)", a["href"])
+        if m:
+            course_names[m.group(1)] = a.get_text(strip=True)
+
+    all_events: list = []
+    modules = ["assign", "quiz"]
+
+    for cid in course_ids:
+        cname = course_names.get(cid, f"course {cid}")
+        for mod in modules:
+            evts = get_module_events(session, cid, mod, cname, time_from, time_to)
+            if evts:
+                print(f"  [{cname}] {mod}: {len(evts)}개")
+            all_events.extend(evts)
+
+    return all_events
 
 
 # ──────────────────────────────────────────────
@@ -257,8 +261,8 @@ def build_slack_blocks(events_by_days: dict, today) -> list:
     }]
 
     for days_left in sorted(events_by_days.keys()):
-        events = events_by_days[days_left]
-        if not events:
+        evts = events_by_days[days_left]
+        if not evts:
             continue
 
         if days_left == 0:
@@ -270,27 +274,26 @@ def build_slack_blocks(events_by_days: dict, today) -> list:
 
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": label}})
 
-        for event in events:
-            deadline = datetime.fromtimestamp(event["timesort"], tz=KST)
-            wd = WEEKDAY_KO[deadline.weekday()]
+        for event in evts:
+            dl = datetime.fromtimestamp(event["timesort"], tz=KST)
+            wd = WEEKDAY_KO[dl.weekday()]
             emoji = MODULE_EMOJI.get(event.get("modulename", ""), "📌")
             course = event.get("course", {}).get("fullname", "")
 
             lines = [f"{emoji} *{event['name']}*"]
             if course:
                 lines.append(f"    과목: {course}")
-            lines.append(f"    마감: {deadline.strftime('%m/%d')}({wd}) {deadline.strftime('%H:%M')}")
+            lines.append(f"    마감: {dl.strftime('%m/%d')}({wd}) {dl.strftime('%H:%M')}")
 
             block: dict = {
                 "type": "section",
                 "text": {"type": "mrkdwn", "text": "\n".join(lines)},
             }
-            url = event.get("url")
-            if url:
+            if event.get("url"):
                 block["accessory"] = {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "바로가기", "emoji": True},
-                    "url": url,
+                    "url": event["url"],
                 }
             blocks.append(block)
 
@@ -309,41 +312,38 @@ def send_slack(webhook_url: str, blocks: list) -> None:
 # ──────────────────────────────────────────────
 
 def main() -> None:
-    username = os.environ.get("LEARNUS_USERNAME")
-    password = os.environ.get("LEARNUS_PASSWORD")
+    username    = os.environ.get("LEARNUS_USERNAME")
+    password    = os.environ.get("LEARNUS_PASSWORD")
     webhook_url = os.environ.get("SLACK_WEBHOOK_URL")
 
     if not all([username, password, webhook_url]):
-        print("환경변수 누락: LEARNUS_USERNAME, LEARNUS_PASSWORD, SLACK_WEBHOOK_URL", file=sys.stderr)
+        print("환경변수 누락: LEARNUS_USERNAME / LEARNUS_PASSWORD / SLACK_WEBHOOK_URL", file=sys.stderr)
         sys.exit(1)
 
-    now = datetime.now(KST)
+    now   = datetime.now(KST)
     today = now.date()
     print(f"실행 시각: {now.strftime('%Y-%m-%d %H:%M KST')}")
 
     session = login(username, password)
     print("로그인 성공")
 
-    sesskey = get_sesskey(session)
-    print("sesskey 획득")
+    events = get_upcoming_events(session)
 
-    events = get_upcoming_events(session, sesskey)
-
-    # 전체 이벤트 디버그 출력
     print(f"\n[전체 이벤트 - {len(events)}개]")
     for e in events:
         dl = datetime.fromtimestamp(e["timesort"], tz=KST)
-        days_left = (dl.date() - today).days
-        print(f"  D{days_left:+d} | {dl.strftime('%m/%d %H:%M')} | {e.get('modulename','?'):10s} | {e['name']}")
+        diff = (dl.date() - today).days
+        print(f"  D{diff:+d} | {dl.strftime('%m/%d %H:%M')} | {e.get('modulename','?'):8s} | {e['name']}")
 
     # 오전(~18시): 오늘·내일·3일 후 / 오후(18시~): 오늘만
     days_to_check = [0, 1, 3] if now.hour < 18 else [0]
     events_by_days: dict[int, list] = {d: [] for d in days_to_check}
+
     for event in events:
         dl = datetime.fromtimestamp(event["timesort"], tz=KST)
-        days_left = (dl.date() - today).days
-        if days_left in events_by_days:
-            events_by_days[days_left].append(event)
+        diff = (dl.date() - today).days
+        if diff in events_by_days:
+            events_by_days[diff].append(event)
 
     total = sum(len(v) for v in events_by_days.values())
     if total == 0:
