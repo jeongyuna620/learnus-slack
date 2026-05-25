@@ -111,128 +111,61 @@ def get_upcoming_events(session: requests.Session, sesskey: str) -> list:
     return all_events
 
 
-def _get_user_id(session: requests.Session) -> str | None:
-    """현재 로그인 사용자의 Moodle user ID 추출. 여러 페이지·패턴 시도."""
-    patterns = [
-        r'"userid"\s*:\s*"?(\d+)"?',      # "userid":12345 or "userid":"12345"
-        r"'userid'\s*:\s*'?(\d+)'?",       # 'userid':12345
-        r'data-userid=["\'](\d+)["\']',    # data-userid="12345"
-        r'"MyUserId"\s*:\s*(\d+)',          # Moodle 일부 테마
-    ]
-    urls = [
-        f"{LEARNUS_URL}/my/",
-        f"{LEARNUS_URL}/user/profile.php",          # 자기 프로필로 리다이렉트
-        f"{LEARNUS_URL}/grade/report/overview/index.php",
-    ]
-    for url in urls:
-        try:
-            resp = session.get(url, timeout=30)
-            if "login" in resp.url.lower():
-                continue
-            # 리다이렉트 후 URL에서 id= 추출 (profile.php → view.php?id=X)
-            m = re.search(r'/user/(?:view|profile)\.php\?(?:.*&)?id=(\d+)', resp.url)
-            if m and int(m.group(1)) > 0:
-                return m.group(1)
-            for pat in patterns:
-                m = re.search(pat, resp.text)
-                if m and int(m.group(1)) > 0:
-                    return m.group(1)
-            # 프로필 링크에서 추출
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for a in soup.find_all("a", href=re.compile(r"user/view\.php")):
-                m = re.search(r"\bid=(\d+)", a["href"])
-                if m and int(m.group(1)) > 0:
-                    return m.group(1)
-        except Exception:
-            pass
-    return None
-
-
 def _get_enrolled_courses(session: requests.Session, sesskey: str,
                           ajax_events: list | None = None) -> dict[str, str]:
-    """수강 과목 목록 반환 {course_id: fullname}. 세 단계 폴백."""
+    """수강 과목 목록 반환 {course_id: fullname}.
+    HTML 스크래핑 + 이벤트 추출을 항상 병합."""
+    # ── HTML 스크래핑 (서버사이드 렌더링 페이지) ───────────────────
+    courses = _get_course_ids(session)
 
-    def _try_enrol_ajax(uid: int) -> dict[str, str]:
-        payload = [{"index": 0,
-                    "methodname": "core_enrol_get_users_courses",
-                    "args": {"userid": uid}}]
-        r = session.post(
-            f"{LEARNUS_URL}/lib/ajax/service.php",
-            params={"sesskey": sesskey},
-            json=payload,
-            headers={"Referer": f"{LEARNUS_URL}/my/",
-                     "X-Requested-With": "XMLHttpRequest"},
-            timeout=30,
-        )
-        d = r.json()
-        if isinstance(d, list) and d and not d[0].get("error"):
-            raw = d[0].get("data", [])
-            return {str(c["id"]): c["fullname"] for c in raw
-                    if c.get("id") and int(c["id"]) > 10}
-        exc = d[0].get("exception", {}) if isinstance(d, list) and d else d
-        print(f"  enrol AJAX(uid={uid}) 실패: {exc}")
-        return {}
-
-    # ── 방법 A: core_enrol_get_users_courses (user ID 추출 후) ────
-    userid = _get_user_id(session)
-    print(f"user ID: {userid}")
-    try:
-        uid = int(userid) if userid else 0
-        courses = _try_enrol_ajax(uid)
-        if not courses and uid != 0:
-            courses = _try_enrol_ajax(0)   # userid=0 → 현재 사용자 (일부 버전)
-        if courses:
-            print(f"수강 과목 {len(courses)}개 (enrol AJAX): "
-                  f"{list(courses.values())[:5]}")
-            return courses
-    except Exception as e:
-        print(f"enrol AJAX 예외: {e}")
-
-    # ── 방법 B: 이미 받은 캘린더 이벤트에서 과목 ID 추출 ───────────
+    # ── 이벤트에서 보완 (스크래핑으로 못 찾은 과목 추가) ───────────
     if ajax_events:
-        courses = {}
         for ev in ajax_events:
             c = ev.get("course", {})
             cid = str(c.get("id", ""))
             cname = c.get("fullname", "")
             if cid and cid.isdigit() and int(cid) > 10 and cname:
-                courses[cid] = cname
-        if courses:
-            print(f"수강 과목 {len(courses)}개 (이벤트 추출): "
-                  f"{list(courses.values())[:5]}")
-            return courses
+                courses.setdefault(cid, cname)
 
-    # ── 방법 C: HTML 스크래핑 폴백 ────────────────────────────────
-    return _get_course_ids(session)
+    print(f"수강 과목 합계 {len(courses)}개: {list(courses.values())[:8]}")
+    return courses
 
 
 def _get_course_ids(session: requests.Session) -> dict[str, str]:
+    """여러 페이지에서 course/view.php 링크를 수집해 {course_id: name} 반환."""
     courses: dict[str, str] = {}
-    for url in [
-        f"{LEARNUS_URL}/grade/report/overview/index.php",  # 표준 Moodle 성적 개요
+    pages = [
+        f"{LEARNUS_URL}/grade/report/overview/index.php",  # 성적 개요 (서버사이드)
+        f"{LEARNUS_URL}/user/profile.php",                 # 내 프로필 (수강 과목 목록)
         f"{LEARNUS_URL}/grade/overview/index.php",
         f"{LEARNUS_URL}/my/",
-        f"{LEARNUS_URL}/course/index.php",
-    ]:
+    ]
+    for url in pages:
         try:
             resp = session.get(url, timeout=30)
             if "login" in resp.url.lower():
+                print(f"  [{url}] → login 리다이렉트, 건너뜀")
                 continue
             soup = BeautifulSoup(resp.text, "html.parser")
+            before = len(courses)
             for a in soup.find_all("a", href=re.compile(r"course/view\.php")):
-                m = re.search(r"id=(\d+)", a["href"])
-                if m and int(m.group(1)) > 10:
-                    courses[m.group(1)] = a.get_text(strip=True)
-            # grade report 링크에서도 추출
-            for a in soup.find_all("a", href=re.compile(r"grade/report")):
                 m = re.search(r"id=(\d+)", a["href"])
                 if m and int(m.group(1)) > 10:
                     name = a.get_text(strip=True)
                     if name:
                         courses[m.group(1)] = name
+            # grade/report 링크에서 course id 추가 추출
+            for a in soup.find_all("a", href=re.compile(r"grade/report")):
+                m = re.search(r"id=(\d+)", a["href"])
+                if m and int(m.group(1)) > 10:
+                    name = a.get_text(strip=True)
+                    if name and m.group(1) not in courses:
+                        courses[m.group(1)] = name
+            added = len(courses) - before
+            print(f"  [{url.split('/')[-2]+'/'+url.split('/')[-1]}] "
+                  f"→ {added}개 추가 (누적 {len(courses)}개)")
         except Exception as e:
-            print(f"과목 수집 실패 [{url}]: {e}")
-    print(f"수강 과목 {len(courses)}개: {list(courses.values())[:5]}")
+            print(f"  과목 스크래핑 실패 [{url}]: {e}")
     return courses
 
 
