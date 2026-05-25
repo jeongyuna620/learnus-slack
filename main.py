@@ -63,10 +63,14 @@ def get_sesskey(session: requests.Session) -> str:
 def get_upcoming_events(session: requests.Session, sesskey: str) -> list:
     now = datetime.now(KST)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    time_from = int(today_start.timestamp())
-    time_to   = int((today_start + timedelta(days=8)).timestamp())
+    dt_from = today_start
+    dt_to   = today_start + timedelta(days=8)
+    time_from = int(dt_from.timestamp())
+    time_to   = int(dt_to.timestamp())
 
-    # 방법 1: AJAX 캘린더 API
+    ajax_events: list = []
+
+    # 방법 1: AJAX 캘린더 API (과제/퀴즈 등)
     try:
         payload = [{"index": 0,
                     "methodname": "core_calendar_get_action_events_by_timesort",
@@ -83,32 +87,121 @@ def get_upcoming_events(session: requests.Session, sesskey: str) -> list:
         data = resp.json()
         result = data[0]
         if not result.get("error"):
-            events = result["data"]["events"]
-            print(f"AJAX 이벤트 {len(events)}개")
-            return events
-        exc = result.get("exception", {})
-        print(f"AJAX 실패: {exc.get('message') or exc.get('errorcode')}")
+            ajax_events = result["data"]["events"]
+            print(f"AJAX 이벤트 {len(ajax_events)}개")
+        else:
+            exc = result.get("exception", {})
+            print(f"AJAX 실패: {exc.get('message') or exc.get('errorcode')}")
+            # AJAX 실패 시 스크래핑으로 과제/퀴즈 수집
+            ajax_events = _scrape_course_events(session, dt_from, dt_to)
     except Exception as e:
         print(f"AJAX 예외: {e}")
+        ajax_events = _scrape_course_events(session, dt_from, dt_to)
 
-    # 방법 2: 성적 페이지 → 과목 목록 → 과제 페이지 스크래핑
-    return _scrape_course_events(session, today_start, today_start + timedelta(days=8))
+    # 방법 2: 강의 페이지 스크래핑 — 동영상(VOD) 마감일 추가
+    courses = _get_course_ids(session)
+    vod_events = _get_vod_events(session, courses, dt_from, dt_to) if courses else []
+
+    # AJAX 이벤트 URL 키 집합 (중복 방지)
+    ajax_urls = {e.get("url", "") for e in ajax_events if e.get("url")}
+    unique_vod = [e for e in vod_events if e.get("url", "") not in ajax_urls]
+
+    all_events = ajax_events + unique_vod
+    all_events.sort(key=lambda e: e["timesort"])
+    return all_events
 
 
 def _get_course_ids(session: requests.Session) -> dict[str, str]:
     courses: dict[str, str] = {}
-    for url in [f"{LEARNUS_URL}/grade/overview/index.php", f"{LEARNUS_URL}/my/"]:
+    for url in [
+        f"{LEARNUS_URL}/grade/overview/index.php",
+        f"{LEARNUS_URL}/my/",
+        f"{LEARNUS_URL}/course/index.php",
+    ]:
         try:
             resp = session.get(url, timeout=30)
+            if "login" in resp.url.lower():
+                continue
             soup = BeautifulSoup(resp.text, "html.parser")
             for a in soup.find_all("a", href=re.compile(r"course/view\.php")):
                 m = re.search(r"id=(\d+)", a["href"])
                 if m and int(m.group(1)) > 10:
                     courses[m.group(1)] = a.get_text(strip=True)
+            # grade report 링크에서도 추출
+            for a in soup.find_all("a", href=re.compile(r"grade/report")):
+                m = re.search(r"id=(\d+)", a["href"])
+                if m and int(m.group(1)) > 10:
+                    name = a.get_text(strip=True)
+                    if name:
+                        courses[m.group(1)] = name
         except Exception as e:
             print(f"과목 수집 실패 [{url}]: {e}")
-    print(f"수강 과목 {len(courses)}개")
+    print(f"수강 과목 {len(courses)}개: {list(courses.values())[:5]}")
     return courses
+
+
+def _get_vod_events(session: requests.Session,
+                    courses: dict[str, str],
+                    time_from: datetime, time_to: datetime) -> list:
+    """강의 페이지에서 동영상(vod/url 등) 마감일 수집."""
+    events: list = []
+    for cid, cname in courses.items():
+        try:
+            resp = session.get(f"{LEARNUS_URL}/course/view.php",
+                               params={"id": cid}, timeout=20)
+            if resp.status_code != 200 or "login" in resp.url.lower():
+                continue
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            # 활동 목록에서 vod / 동영상 관련 요소 탐색
+            for li in soup.find_all("li", class_=re.compile(r"modtype_")):
+                mod_class = " ".join(li.get("class", []))
+                # vod, url, resource 계열만
+                if not any(k in mod_class for k in ("vod", "url", "resource", "ubboard")):
+                    continue
+
+                name_a = li.find("a", href=re.compile(r"/mod/"))
+                if not name_a:
+                    continue
+                name = name_a.get_text(strip=True)
+
+                # completionexpected / data-date 속성에서 마감일 추출
+                deadline = None
+                for el in li.find_all(True):
+                    for attr in ("data-completionexpected", "data-timedue",
+                                 "data-date", "data-timestamp"):
+                        val = el.get(attr)
+                        if val and re.fullmatch(r"\d{8,}", val):
+                            deadline = datetime.fromtimestamp(int(val), tz=KST)
+                            break
+                    if deadline:
+                        break
+
+                # 텍스트에서도 날짜 파싱 시도
+                if not deadline:
+                    for span in li.find_all(["span", "div", "small"]):
+                        txt = span.get_text(strip=True)
+                        deadline = _parse_deadline(txt)
+                        if deadline:
+                            break
+
+                if not deadline:
+                    continue
+
+                dl = deadline if deadline.tzinfo else KST.localize(deadline)
+                if time_from <= dl <= time_to:
+                    events.append({
+                        "name": name,
+                        "timesort": int(dl.timestamp()),
+                        "modulename": "vod",
+                        "url": name_a.get("href", ""),
+                        "course": {"fullname": cname},
+                    })
+        except Exception as e:
+            print(f"  [vod/{cid}] 오류: {e}")
+
+    print(f"동영상 이벤트 {len(events)}개")
+    return events
 
 
 def _parse_deadline(text: str) -> datetime | None:
