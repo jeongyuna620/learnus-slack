@@ -241,13 +241,16 @@ def _get_course_ids(session: requests.Session) -> dict[str, str]:
                     name = a.get_text(strip=True)
                     if name and name.lower() not in _FAKE_COURSE_NAMES:
                         courses.setdefault(m.group(1), name)
+            # course/user.php?mode=grade&id=X 링크 (LearnUS 성적 개요 형식)
+            for a in soup.find_all("a", href=re.compile(r"course/user\.php")):
+                if "mode=grade" not in a.get("href", ""):
+                    continue
+                m = re.search(r"\bid=(\d+)", a["href"])
+                if m and int(m.group(1)) > 10:
+                    name = a.get_text(strip=True)
+                    if name and name.lower() not in _FAKE_COURSE_NAMES:
+                        courses.setdefault(m.group(1), name)
             added = len(courses) - before
-            # 성적 개요 페이지에서 id=포함 링크 디버그 (아직 과목 못 찾은 경우)
-            if "grade/report/overview" in url and added == 0:
-                id_links = [(a.get("href", "")[-60:], a.get_text(strip=True)[:20])
-                            for a in soup.find_all("a", href=re.compile(r"id=\d+"))
-                            if int(re.search(r"id=(\d+)", a.get("href","") or "0").group(1) if re.search(r"id=(\d+)", a.get("href","")) else "0") > 10]
-                print(f"  [grade/overview] id=링크 샘플: {id_links[:8]}")
         except Exception as e:
             print(f"  과목 스크래핑 실패 [{url}]: {e}")
     return courses
