@@ -215,54 +215,62 @@ def _get_course_ids(session: requests.Session) -> dict[str, str]:
     return courses
 
 
+def _extract_deadline_from_li(li) -> "datetime | None":
+    """li 요소에서 마감일 추출 (속성 → 텍스트 순)."""
+    for el in li.find_all(True):
+        for attr in ("data-completionexpected", "data-timedue",
+                     "data-duedate", "data-date", "data-timestamp"):
+            val = el.get(attr)
+            if val and re.fullmatch(r"\d{8,}", str(val)):
+                return datetime.fromtimestamp(int(val), tz=KST)
+    # 텍스트 파싱 (span/div/small/p 전체)
+    for el in li.find_all(["span", "div", "small", "p", "td"]):
+        dl = _parse_deadline(el.get_text(strip=True))
+        if dl:
+            return dl
+    return None
+
+
 def _get_vod_events(session: requests.Session,
                     courses: dict[str, str],
                     time_from: datetime, time_to: datetime) -> list:
-    """강의 페이지에서 동영상(vod/url 등) 마감일 수집."""
+    """강의 페이지 + /mod/vod/index.php 에서 동영상 마감일 수집."""
     events: list = []
+
     for cid, cname in courses.items():
+        found_in_course = 0
         try:
+            # ── 과목 메인 페이지 ──────────────────────────────────
             resp = session.get(f"{LEARNUS_URL}/course/view.php",
                                params={"id": cid}, timeout=20)
             if resp.status_code != 200 or "login" in resp.url.lower():
+                print(f"  [{cname}] course/view 접근 불가")
                 continue
             soup = BeautifulSoup(resp.text, "html.parser")
 
-            # 활동 목록에서 vod / 동영상 관련 요소 탐색
-            for li in soup.find_all("li", class_=re.compile(r"modtype_")):
-                mod_class = " ".join(li.get("class", []))
-                # vod, url, resource 계열만
-                if not any(k in mod_class for k in ("vod", "url", "resource", "ubboard")):
-                    continue
+            all_li = soup.find_all("li", class_=re.compile(r"modtype_"))
+            # 모든 모듈 타입 집계 (디버그)
+            mod_types = {}
+            for li in all_li:
+                m = re.search(r"modtype_(\w+)", " ".join(li.get("class", [])))
+                if m:
+                    mod_types[m.group(1)] = mod_types.get(m.group(1), 0) + 1
+            print(f"  [{cname}] 활동 {len(all_li)}개: {mod_types}")
 
+            for li in all_li:
+                mod_class = " ".join(li.get("class", []))
+                # vod 계열 + url/resource(링크형) + ubboard + linkplus 포함
+                if not any(k in mod_class for k in
+                           ("vod", "url", "resource", "ubboard",
+                            "linkplus", "univ", "uvisum")):
+                    continue
                 name_a = li.find("a", href=re.compile(r"/mod/"))
                 if not name_a:
                     continue
                 name = name_a.get_text(strip=True)
-
-                # completionexpected / data-date 속성에서 마감일 추출
-                deadline = None
-                for el in li.find_all(True):
-                    for attr in ("data-completionexpected", "data-timedue",
-                                 "data-date", "data-timestamp"):
-                        val = el.get(attr)
-                        if val and re.fullmatch(r"\d{8,}", val):
-                            deadline = datetime.fromtimestamp(int(val), tz=KST)
-                            break
-                    if deadline:
-                        break
-
-                # 텍스트에서도 날짜 파싱 시도
-                if not deadline:
-                    for span in li.find_all(["span", "div", "small"]):
-                        txt = span.get_text(strip=True)
-                        deadline = _parse_deadline(txt)
-                        if deadline:
-                            break
-
+                deadline = _extract_deadline_from_li(li)
                 if not deadline:
                     continue
-
                 dl = deadline if deadline.tzinfo else KST.localize(deadline)
                 if time_from <= dl <= time_to:
                     events.append({
@@ -272,10 +280,54 @@ def _get_vod_events(session: requests.Session,
                         "url": name_a.get("href", ""),
                         "course": {"fullname": cname},
                     })
-        except Exception as e:
-            print(f"  [vod/{cid}] 오류: {e}")
+                    found_in_course += 1
 
-    print(f"동영상 이벤트 {len(events)}개")
+        except Exception as e:
+            print(f"  [{cname}] course/view 오류: {e}")
+
+        try:
+            # ── /mod/vod/index.php (vod 목록 전용 페이지) ────────
+            resp2 = session.get(f"{LEARNUS_URL}/mod/vod/index.php",
+                                params={"id": cid}, timeout=20)
+            if resp2.status_code == 200 and "login" not in resp2.url.lower():
+                soup2 = BeautifulSoup(resp2.text, "html.parser")
+                rows = soup2.find_all("tr")
+                print(f"  [{cname}] vod/index rows={len(rows)}")
+                for row in rows:
+                    cells = row.find_all("td")
+                    if len(cells) < 2:
+                        continue
+                    name_a = cells[0].find("a")
+                    if not name_a:
+                        continue
+                    name = name_a.get_text(strip=True)
+                    deadline = None
+                    for cell in cells[1:]:
+                        deadline = _parse_deadline(cell.get_text(strip=True))
+                        if deadline:
+                            break
+                    if not deadline:
+                        deadline = _extract_deadline_from_li(row)
+                    if not deadline:
+                        continue
+                    dl = deadline if deadline.tzinfo else KST.localize(deadline)
+                    url = name_a.get("href", "")
+                    already = any(e["url"] == url for e in events)
+                    if time_from <= dl <= time_to and not already:
+                        events.append({
+                            "name": name,
+                            "timesort": int(dl.timestamp()),
+                            "modulename": "vod",
+                            "url": url,
+                            "course": {"fullname": cname},
+                        })
+                        found_in_course += 1
+        except Exception as e:
+            print(f"  [{cname}] vod/index 오류: {e}")
+
+        print(f"  [{cname}] 동영상 이벤트 {found_in_course}개")
+
+    print(f"동영상 이벤트 합계 {len(events)}개")
     return events
 
 
