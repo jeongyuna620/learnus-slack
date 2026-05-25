@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import time
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
@@ -10,172 +11,206 @@ KST = pytz.timezone("Asia/Seoul")
 LEARNUS_URL = "https://ys.learnus.org"
 
 MODULE_EMOJI = {
-    "assign": "📝",
-    "quiz":   "📊",
-    "vod":    "🎥",
-    "zoom":   "💻",
-    "data":   "📋",
-    "forum":  "💬",
+    "assign": "📝", "quiz": "📊", "vod": "🎥",
+    "zoom": "💻", "data": "📋", "forum": "💬",
 }
 WEEKDAY_KO = ["월", "화", "수", "목", "금", "토", "일"]
 
 
 # ──────────────────────────────────────────────
-# 로그인
+# Selenium으로 로그인 → MoodleSession 쿠키 획득
 # ──────────────────────────────────────────────
 
-def login(username: str, password: str) -> requests.Session:
+def get_cookies_via_browser(username: str, password: str) -> dict:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from webdriver_manager.chrome import ChromeDriverManager
+
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1280,800")
+
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
+
+    try:
+        print(f"브라우저 로그인 시작: {LEARNUS_URL}/login.php")
+        driver.get(f"{LEARNUS_URL}/login.php")
+
+        wait = WebDriverWait(driver, 20)
+
+        # 아이디 입력
+        user_el = wait.until(EC.presence_of_element_located(
+            (By.CSS_SELECTOR, "input[name='username'], input[id='username']")))
+        user_el.clear()
+        user_el.send_keys(username)
+
+        # 비밀번호 입력
+        pass_el = driver.find_element(
+            By.CSS_SELECTOR, "input[name='password'], input[type='password']")
+        pass_el.clear()
+        pass_el.send_keys(password)
+
+        # 로그인 버튼
+        submit_el = driver.find_element(
+            By.CSS_SELECTOR, "button[type='submit'], input[type='submit']")
+        submit_el.click()
+
+        # 로그인 완료 대기 (login URL에서 벗어날 때까지)
+        wait.until(lambda d: "login" not in d.current_url.lower())
+        time.sleep(2)
+
+        print(f"로그인 후 URL: {driver.current_url}")
+
+        # 쿠키 수집
+        cookies = {c["name"]: c["value"] for c in driver.get_cookies()}
+        print(f"획득한 쿠키: {list(cookies.keys())}")
+
+        if "MoodleSession" not in cookies:
+            raise RuntimeError("MoodleSession 쿠키 없음 — 로그인 실패")
+
+        return cookies
+
+    finally:
+        driver.quit()
+
+
+def build_session(cookies: dict) -> requests.Session:
     session = requests.Session()
     session.headers.update({
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "ko-KR,ko;q=0.9",
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
     })
-
-    # 로그인 페이지 로드 (login.php → login/index.php 순 시도)
-    for login_path in ["/login.php", "/login/index.php"]:
-        resp = session.get(f"{LEARNUS_URL}{login_path}", timeout=30)
-        print(f"GET {login_path} → 최종URL: {resp.url}")
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # 폼에서 입력 필드 수집
-        form = soup.find("form")
-        if not form:
-            continue
-
-        form_data: dict = {}
-        for inp in form.find_all("input"):
-            name = inp.get("name")
-            if name:
-                form_data[name] = inp.get("value", "")
-
-        print(f"  폼 필드: {list(form_data.keys())}")
-
-        # 아이디/비밀번호 삽입
-        for ufield in ["username", "id", "loginid", "userid"]:
-            if ufield in form_data:
-                form_data[ufield] = username
-                break
-        for pfield in ["password", "passwd", "pw"]:
-            if pfield in form_data:
-                form_data[pfield] = password
-                break
-
-        action = form.get("action", resp.url)
-        if action and not action.startswith("http"):
-            action = LEARNUS_URL + action
-
-        print(f"  POST → {action}")
-        resp = session.post(action, data=form_data, timeout=30)
-        print(f"  로그인 후 URL: {resp.url}")
-        print(f"  쿠키: {list(session.cookies.keys())}")
-
-        # 로그인 성공 판단: login 페이지가 아니면 성공
-        if "login" not in resp.url.lower() and "error" not in resp.url.lower():
-            print("로그인 성공")
-            return session
-
-        print(f"  → 로그인 실패, 다음 방법 시도")
-
-    raise RuntimeError("모든 로그인 방법 실패 — SSO 흐름 확인 필요")
+    for name, value in cookies.items():
+        session.cookies.set(name, value, domain="ys.learnus.org")
+    return session
 
 
 # ──────────────────────────────────────────────
-# 수강 과목 ID 수집
+# sesskey 추출
 # ──────────────────────────────────────────────
 
-def debug_page(label: str, resp: requests.Response) -> None:
+def get_sesskey(session: requests.Session) -> str:
+    resp = session.get(f"{LEARNUS_URL}/my/", timeout=30)
+    resp.raise_for_status()
+    print(f"대시보드 URL: {resp.url}")
+
+    match = re.search(r'"sesskey"\s*:\s*"([a-zA-Z0-9]+)"', resp.text)
+    if match:
+        return match.group(1)
+
     soup = BeautifulSoup(resp.text, "html.parser")
-    title = soup.find("title")
-    all_links = [a.get("href", "") for a in soup.find_all("a", href=True)]
-    print(f"[{label}] 최종URL={resp.url} | status={resp.status_code} | "
-          f"title={title.get_text(strip=True)[:60] if title else 'N/A'} | "
-          f"링크수={len(all_links)}")
-    # 링크 샘플 (course/grade/mod 관련)
-    samples = [h for h in all_links if any(k in h for k in ("course", "grade", "mod", "assign", "quiz"))]
-    for h in samples[:10]:
-        print(f"  → {h}")
-    if not samples:
-        print(f"  (관련 링크 없음, 전체 샘플: {all_links[:5]})")
+    el = soup.find("input", {"name": "sesskey"})
+    if el:
+        return el["value"]
+
+    raise RuntimeError("sesskey를 찾을 수 없음")
 
 
-def get_course_ids(session: requests.Session) -> list[str]:
-    ids: set[str] = set()
+# ──────────────────────────────────────────────
+# 이벤트 조회 (AJAX → 과목 페이지 스크래핑 순)
+# ──────────────────────────────────────────────
 
-    pages = [
-        ("성적 개요", f"{LEARNUS_URL}/grade/overview/index.php", {}),
-        ("내 강좌", f"{LEARNUS_URL}/course/index.php", {"mycourses": 1}),
-        ("프로필", f"{LEARNUS_URL}/user/profile.php", {}),
-        ("대시보드", f"{LEARNUS_URL}/my/", {}),
-    ]
+def get_upcoming_events(session: requests.Session, sesskey: str) -> list:
+    now = datetime.now(KST)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    time_from = int(today_start.timestamp())
+    time_to   = int((today_start + timedelta(days=8)).timestamp())
 
-    for label, url, params in pages:
+    # 방법 1: AJAX 캘린더 API
+    try:
+        payload = [{"index": 0,
+                    "methodname": "core_calendar_get_action_events_by_timesort",
+                    "args": {"timesortfrom": time_from, "timesortto": time_to,
+                             "limitnum": 100}}]
+        resp = session.post(
+            f"{LEARNUS_URL}/lib/ajax/service.php",
+            params={"sesskey": sesskey},
+            json=payload,
+            headers={"Referer": f"{LEARNUS_URL}/my/",
+                     "X-Requested-With": "XMLHttpRequest"},
+            timeout=30,
+        )
+        data = resp.json()
+        result = data[0]
+        if not result.get("error"):
+            events = result["data"]["events"]
+            print(f"AJAX 이벤트 {len(events)}개")
+            return events
+        exc = result.get("exception", {})
+        print(f"AJAX 실패: {exc.get('message') or exc.get('errorcode')}")
+    except Exception as e:
+        print(f"AJAX 예외: {e}")
+
+    # 방법 2: 과목 페이지 스크래핑
+    return _scrape_course_events(session, today_start,
+                                 today_start + timedelta(days=8))
+
+
+def _get_course_ids(session: requests.Session) -> dict[str, str]:
+    """course_id → course_name 딕셔너리 반환."""
+    courses: dict[str, str] = {}
+
+    for url, params in [
+        (f"{LEARNUS_URL}/grade/overview/index.php", {}),
+        (f"{LEARNUS_URL}/my/", {}),
+    ]:
         try:
             resp = session.get(url, params=params, timeout=30)
-            debug_page(label, resp)
-            for m in re.finditer(r'course/view\.php[^"\'<>\s]*[?&]id=(\d+)', resp.text):
-                ids.add(m.group(1))
-            for m in re.finditer(r'grade/report/user/index\.php[^"\'<>\s]*[?&]id=(\d+)', resp.text):
-                ids.add(m.group(1))
+            print(f"과목 수집 [{url}] → {resp.url}, 상태={resp.status_code}")
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for a in soup.find_all("a", href=re.compile(r"course/view\.php")):
+                m = re.search(r"id=(\d+)", a["href"])
+                if m and int(m.group(1)) > 10:
+                    courses[m.group(1)] = a.get_text(strip=True)
         except Exception as e:
-            print(f"[{label}] 실패: {e}")
+            print(f"  실패: {e}")
 
-    ids = {i for i in ids if int(i) > 10}
-    print(f"최종 수강 과목: {sorted(ids)}")
-    return sorted(ids)
-
-
-# ──────────────────────────────────────────────
-# 과목별 과제/퀴즈 마감일 수집
-# ──────────────────────────────────────────────
-
-_KO_MONTHS = {"1월":1,"2월":2,"3월":3,"4월":4,"5월":5,"6월":6,
-              "7월":7,"8월":8,"9월":9,"10월":10,"11월":11,"12월":12}
-_EN_MONTHS = {"january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
-              "july":7,"august":8,"september":9,"october":10,"november":11,"december":12,
-              "jan":1,"feb":2,"mar":3,"apr":4,"jun":6,"jul":7,"aug":8,
-              "sep":9,"oct":10,"nov":11,"dec":12}
+    print(f"수강 과목 {len(courses)}개: {list(courses.items())[:5]}")
+    return courses
 
 
-def parse_deadline(text: str) -> datetime | None:
+def _parse_deadline(text: str) -> datetime | None:
     text = text.strip()
     if not text or text in ("-", "마감일 없음", "No due date"):
         return None
-
-    # Unix timestamp가 그대로 노출된 경우
     if re.fullmatch(r"\d{10,}", text):
         return datetime.fromtimestamp(int(text), tz=KST)
 
-    # 한국어: "2026년 5월 25일 오후 11:59"
     m = re.search(r"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일"
                   r"(?:[^0-9]*)?(오전|오후)?\s*(\d{1,2}):(\d{2})", text)
     if m:
         y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
         ampm, h, mi = m.group(4), int(m.group(5)), int(m.group(6))
-        if ampm == "오후" and h != 12:
-            h += 12
-        elif ampm == "오전" and h == 12:
-            h = 0
+        if ampm == "오후" and h != 12: h += 12
+        elif ampm == "오전" and h == 12: h = 0
         try:
             return KST.localize(datetime(y, mo, d, h, mi))
         except ValueError:
             pass
 
-    # 영어: "25 May 2026, 11:59 PM"
+    en_months = {"january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
+                 "july":7,"august":8,"september":9,"october":10,"november":11,"december":12,
+                 "jan":1,"feb":2,"mar":3,"apr":4,"jun":6,"jul":7,"aug":8,
+                 "sep":9,"oct":10,"nov":11,"dec":12}
     m = re.search(r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4}),?\s+(\d{1,2}):(\d{2})(?:\s*(AM|PM))?",
                   text, re.IGNORECASE)
     if m:
         d, mon_s, y = int(m.group(1)), m.group(2).lower(), int(m.group(3))
         h, mi, ampm = int(m.group(4)), int(m.group(5)), (m.group(6) or "").upper()
-        mo = _EN_MONTHS.get(mon_s)
+        mo = en_months.get(mon_s)
         if mo:
-            if ampm == "PM" and h != 12:
-                h += 12
-            elif ampm == "AM" and h == 12:
-                h = 0
+            if ampm == "PM" and h != 12: h += 12
+            elif ampm == "AM" and h == 12: h = 0
             try:
                 return KST.localize(datetime(y, mo, d, h, mi))
             except ValueError:
@@ -183,93 +218,56 @@ def parse_deadline(text: str) -> datetime | None:
     return None
 
 
-def get_module_events(session: requests.Session, course_id: str,
-                      module: str, course_name: str,
-                      time_from: datetime, time_to: datetime) -> list:
-    try:
-        resp = session.get(f"{LEARNUS_URL}/mod/{module}/index.php",
-                           params={"id": course_id}, timeout=20)
-        if resp.status_code != 200:
-            return []
-    except Exception as e:
-        print(f"  [{module}/{course_id}] 요청 실패: {e}")
-        return []
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    events = []
-
-    for row in soup.find_all("tr"):
-        cells = row.find_all("td")
-        if len(cells) < 2:
-            continue
-        name_a = cells[0].find("a")
-        if not name_a:
-            continue
-
-        name    = name_a.get_text(strip=True)
-        act_url = name_a.get("href", "")
-
-        # data-timedue / data-timestamp 속성 우선
-        ts_el = (row.find(attrs={"data-timedue": True})
-                 or row.find(attrs={"data-timestamp": True}))
-        if ts_el:
-            deadline = datetime.fromtimestamp(
-                int(ts_el.get("data-timedue") or ts_el.get("data-timestamp")), tz=KST)
-        else:
-            deadline = None
-            for cell in cells[1:]:
-                deadline = parse_deadline(cell.get_text(strip=True))
-                if deadline:
-                    break
-
-        if not deadline:
-            continue
-
-        dl_aware = deadline if deadline.tzinfo else KST.localize(deadline)
-        if time_from <= dl_aware <= time_to:
-            events.append({
-                "name": name,
-                "timesort": int(dl_aware.timestamp()),
-                "modulename": module,
-                "url": act_url,
-                "course": {"fullname": course_name},
-            })
-    return events
-
-
-def get_upcoming_events(session: requests.Session) -> list:
-    now = datetime.now(KST)
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    time_from = today_start
-    time_to   = today_start + timedelta(days=8)
-
-    course_ids = get_course_ids(session)
-    if not course_ids:
+def _scrape_course_events(session: requests.Session,
+                          time_from: datetime, time_to: datetime) -> list:
+    courses = _get_course_ids(session)
+    if not courses:
         print("수강 과목을 찾지 못했습니다.")
         return []
 
-    # 과목 이름 수집 (성적 페이지)
-    course_names: dict[str, str] = {}
-    try:
-        resp = session.get(f"{LEARNUS_URL}/grade/overview/index.php", timeout=30)
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for a in soup.find_all("a", href=re.compile(r"id=\d+")):
-            m = re.search(r"id=(\d+)", a["href"])
-            if m and m.group(1) in course_ids:
-                course_names[m.group(1)] = a.get_text(strip=True)
-    except Exception:
-        pass
-
-    all_events: list = []
-    for cid in course_ids:
-        cname = course_names.get(cid, f"과목 {cid}")
+    events: list = []
+    for cid, cname in courses.items():
         for mod in ["assign", "quiz"]:
-            evts = get_module_events(session, cid, mod, cname, time_from, time_to)
-            if evts:
-                print(f"  [{cname}] {mod}: {len(evts)}개")
-            all_events.extend(evts)
+            try:
+                resp = session.get(f"{LEARNUS_URL}/mod/{mod}/index.php",
+                                   params={"id": cid}, timeout=20)
+                if resp.status_code != 200:
+                    continue
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for row in soup.find_all("tr"):
+                    cells = row.find_all("td")
+                    if len(cells) < 2:
+                        continue
+                    name_a = cells[0].find("a")
+                    if not name_a:
+                        continue
+                    ts_el = (row.find(attrs={"data-timedue": True})
+                             or row.find(attrs={"data-timestamp": True}))
+                    if ts_el:
+                        deadline = datetime.fromtimestamp(
+                            int(ts_el.get("data-timedue") or ts_el.get("data-timestamp")), tz=KST)
+                    else:
+                        deadline = None
+                        for cell in cells[1:]:
+                            deadline = _parse_deadline(cell.get_text(strip=True))
+                            if deadline:
+                                break
+                    if not deadline:
+                        continue
+                    dl = deadline if deadline.tzinfo else KST.localize(deadline)
+                    if time_from <= dl <= time_to:
+                        events.append({
+                            "name": name_a.get_text(strip=True),
+                            "timesort": int(dl.timestamp()),
+                            "modulename": mod,
+                            "url": name_a.get("href", ""),
+                            "course": {"fullname": cname},
+                        })
+            except Exception as e:
+                print(f"  [{cname}/{mod}] 오류: {e}")
 
-    return all_events
+    print(f"스크래핑 이벤트 {len(events)}개")
+    return events
 
 
 # ──────────────────────────────────────────────
@@ -277,12 +275,10 @@ def get_upcoming_events(session: requests.Session) -> list:
 # ──────────────────────────────────────────────
 
 def build_slack_blocks(events_by_days: dict, today) -> list:
-    blocks = [{
-        "type": "header",
-        "text": {"type": "plain_text",
-                 "text": f"📚 LearnUs 마감 알림  {today.strftime('%m/%d')}",
-                 "emoji": True},
-    }]
+    blocks = [{"type": "header",
+               "text": {"type": "plain_text",
+                        "text": f"📚 LearnUs 마감 알림  {today.strftime('%m/%d')}",
+                        "emoji": True}}]
     for days_left in sorted(events_by_days.keys()):
         evts = events_by_days[days_left]
         if not evts:
@@ -302,11 +298,9 @@ def build_slack_blocks(events_by_days: dict, today) -> list:
             block: dict = {"type": "section",
                            "text": {"type": "mrkdwn", "text": "\n".join(lines)}}
             if e.get("url"):
-                block["accessory"] = {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "바로가기", "emoji": True},
-                    "url": e["url"],
-                }
+                block["accessory"] = {"type": "button",
+                                      "text": {"type": "plain_text", "text": "바로가기"},
+                                      "url": e["url"]}
             blocks.append(block)
         blocks.append({"type": "divider"})
     return blocks
@@ -324,7 +318,6 @@ def main() -> None:
     username    = os.environ.get("LEARNUS_USERNAME")
     password    = os.environ.get("LEARNUS_PASSWORD")
     webhook_url = os.environ.get("SLACK_WEBHOOK_URL")
-
     if not all([username, password, webhook_url]):
         print("환경변수 누락", file=sys.stderr)
         sys.exit(1)
@@ -333,10 +326,14 @@ def main() -> None:
     today = now.date()
     print(f"실행 시각: {now.strftime('%Y-%m-%d %H:%M KST')}")
 
-    session = login(username, password)
-    print("로그인 성공")
+    cookies = get_cookies_via_browser(username, password)
+    session = build_session(cookies)
+    print("세션 구성 완료")
 
-    events = get_upcoming_events(session)
+    sesskey = get_sesskey(session)
+    print(f"sesskey 획득: {sesskey[:8]}...")
+
+    events = get_upcoming_events(session, sesskey)
 
     print(f"\n[전체 이벤트 - {len(events)}개]")
     for e in events:
