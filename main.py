@@ -111,14 +111,60 @@ def get_upcoming_events(session: requests.Session, sesskey: str) -> list:
     return all_events
 
 
+_FAKE_COURSE_NAMES = {"grades overview", "moodle", "home", "calendar", "site"}
+
+def _discover_courses_from_calendar(session: requests.Session,
+                                    sesskey: str) -> dict[str, str]:
+    """학기 전체 기간(오늘 기준 ±6개월)의 캘린더 이벤트에서 과목 ID 수집."""
+    now = datetime.now(KST)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    t_from = int((today - timedelta(days=90)).timestamp())
+    t_to   = int((today + timedelta(days=180)).timestamp())
+    try:
+        payload = [{"index": 0,
+                    "methodname": "core_calendar_get_action_events_by_timesort",
+                    "args": {"timesortfrom": t_from, "timesortto": t_to,
+                             "limitnum": 50}}]
+        resp = session.post(
+            f"{LEARNUS_URL}/lib/ajax/service.php",
+            params={"sesskey": sesskey},
+            json=payload,
+            headers={"Referer": f"{LEARNUS_URL}/my/",
+                     "X-Requested-With": "XMLHttpRequest"},
+            timeout=30,
+        )
+        data = resp.json()
+        result = data[0]
+        if result.get("error"):
+            exc = result.get("exception", {})
+            print(f"학기 캘린더 실패: {exc.get('message') or exc.get('errorcode')}")
+            return {}
+        courses: dict[str, str] = {}
+        for ev in result["data"]["events"]:
+            c = ev.get("course", {})
+            cid = str(c.get("id", ""))
+            cname = c.get("fullname", "")
+            if cid and cid.isdigit() and int(cid) > 10 and cname:
+                courses[cid] = cname
+        print(f"학기 캘린더 이벤트 {len(result['data']['events'])}개 → 과목 {len(courses)}개 발견")
+        return courses
+    except Exception as e:
+        print(f"학기 캘린더 예외: {e}")
+        return {}
+
+
 def _get_enrolled_courses(session: requests.Session, sesskey: str,
                           ajax_events: list | None = None) -> dict[str, str]:
-    """수강 과목 목록 반환 {course_id: fullname}.
-    HTML 스크래핑 + 이벤트 추출을 항상 병합."""
-    # ── HTML 스크래핑 (서버사이드 렌더링 페이지) ───────────────────
-    courses = _get_course_ids(session)
+    """수강 과목 목록 반환 {course_id: fullname}."""
+    # ── 방법 A: 학기 전체 캘린더로 과목 ID 수집 ─────────────────
+    courses = _discover_courses_from_calendar(session, sesskey)
 
-    # ── 이벤트에서 보완 (스크래핑으로 못 찾은 과목 추가) ───────────
+    # ── 방법 B: HTML 스크래핑 보완 ───────────────────────────────
+    for cid, cname in _get_course_ids(session).items():
+        if cid not in courses and cname.lower() not in _FAKE_COURSE_NAMES:
+            courses[cid] = cname
+
+    # ── 방법 C: 직전 AJAX 이벤트에서 보완 ───────────────────────
     if ajax_events:
         for ev in ajax_events:
             c = ev.get("course", {})
