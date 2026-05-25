@@ -24,11 +24,9 @@ WEEKDAY_KO = ["월", "화", "수", "목", "금", "토", "일"]
 def get_cookies_via_browser(username: str, password: str) -> dict:
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.chrome.service import Service
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
-    from webdriver_manager.chrome import ChromeDriverManager
 
     options = Options()
     options.add_argument("--headless=new")
@@ -37,8 +35,8 @@ def get_cookies_via_browser(username: str, password: str) -> dict:
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1280,800")
 
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
+    # Selenium Manager가 자동으로 드라이버 관리 (4.6+)
+    driver = webdriver.Chrome(options=options)
 
     try:
         print(f"브라우저 로그인 시작: {LEARNUS_URL}/login.php")
