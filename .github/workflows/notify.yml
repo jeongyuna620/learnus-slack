@@ -24,7 +24,6 @@ jobs:
 
       - name: Run notifier
         env:
-          LEARNUS_USERNAME: ${{ secrets.LEARNUS_USERNAME }}
-          LEARNUS_PASSWORD: ${{ secrets.LEARNUS_PASSWORD }}
+          LEARNUS_SESSION: ${{ secrets.LEARNUS_SESSION }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: python main.py
