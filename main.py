@@ -41,14 +41,31 @@ def get_cookies_via_browser(username: str, password: str) -> dict:
     try:
         print(f"브라우저 로그인 시작: {LEARNUS_URL}/login.php")
         driver.get(f"{LEARNUS_URL}/login.php")
-        time.sleep(3)  # JS 렌더링 대기
+        time.sleep(4)
 
         print(f"현재 URL: {driver.current_url}")
         print(f"페이지 제목: {driver.title}")
 
-        # 페이지 내 input 요소 전체 출력 (디버그)
+        # 버튼 목록 출력
+        buttons = driver.find_elements(By.TAG_NAME, "button")
+        print(f"버튼 {len(buttons)}개:")
+        for b in buttons[:10]:
+            print(f"  text={b.text[:40]!r} class={b.get_attribute('class')[:40]}")
+
+        # 링크 중 '로그인' 포함된 것
+        links = driver.find_elements(By.TAG_NAME, "a")
+        login_links = [a for a in links if "로그인" in (a.text or "") or "login" in (a.get_attribute("href") or "").lower()]
+        print(f"로그인 관련 링크 {len(login_links)}개:")
+        for a in login_links[:5]:
+            print(f"  text={a.text[:40]!r} href={a.get_attribute('href')}")
+
+        # 페이지 소스 앞부분 출력
+        src = driver.page_source
+        print(f"\n페이지 소스 (앞 1500자):\n{src[:1500]}")
+
+        # input 요소 전체 출력
         inputs = driver.find_elements(By.TAG_NAME, "input")
-        print(f"input 요소 {len(inputs)}개:")
+        print(f"\ninput 요소 {len(inputs)}개:")
         for inp in inputs:
             print(f"  type={inp.get_attribute('type')} name={inp.get_attribute('name')} "
                   f"id={inp.get_attribute('id')} placeholder={inp.get_attribute('placeholder')}")
