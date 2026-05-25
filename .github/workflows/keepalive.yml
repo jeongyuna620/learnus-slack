@@ -1,0 +1,26 @@
+name: LearnUs Session Keep-Alive
+
+on:
+  schedule:
+    - cron: '0 3,9,15,21 * * *'  # 매일 낮 12시, 저녁 6시, 자정, 오전 6시 KST
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping LearnUS to keep session alive
+        env:
+          LEARNUS_SESSION: ${{ secrets.LEARNUS_SESSION }}
+        run: |
+          RESULT=$(curl -s -o /dev/null -w "%{url_effective}" \
+            -b "MoodleSession=$LEARNUS_SESSION" \
+            -L --max-redirs 5 \
+            "https://ys.learnus.org/my/")
+          echo "최종 URL: $RESULT"
+          if echo "$RESULT" | grep -q "login"; then
+            echo "⚠️ 세션 만료됨 — 메인 워크플로우에서 Slack 알림이 전송됩니다"
+            exit 0
+          else
+            echo "✅ 세션 유효 — 세션 연장됨"
+          fi
