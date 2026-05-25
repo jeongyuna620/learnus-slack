@@ -99,7 +99,7 @@ def get_upcoming_events(session: requests.Session, sesskey: str) -> list:
         ajax_events = _scrape_course_events(session, dt_from, dt_to)
 
     # 방법 2: 강의 페이지 스크래핑 — 동영상(VOD) 마감일 추가
-    courses = _get_course_ids(session)
+    courses = _get_enrolled_courses(session, sesskey)
     vod_events = _get_vod_events(session, courses, dt_from, dt_to) if courses else []
 
     # AJAX 이벤트 URL 키 집합 (중복 방지)
@@ -109,6 +109,40 @@ def get_upcoming_events(session: requests.Session, sesskey: str) -> list:
     all_events = ajax_events + unique_vod
     all_events.sort(key=lambda e: e["timesort"])
     return all_events
+
+
+def _get_enrolled_courses(session: requests.Session, sesskey: str) -> dict[str, str]:
+    """수강 과목 목록 반환 {course_id: fullname}.
+    AJAX API 우선, 실패 시 HTML 스크래핑으로 폴백."""
+    # 방법 A: Moodle AJAX — core_course_get_enrolled_courses_by_timeline_classification
+    try:
+        payload = [{"index": 0,
+                    "methodname": "core_course_get_enrolled_courses_by_timeline_classification",
+                    "args": {"offset": 0, "limit": 0, "classification": "all",
+                             "sort": "fullname", "customfieldname": "", "customfieldvalue": ""}}]
+        resp = session.post(
+            f"{LEARNUS_URL}/lib/ajax/service.php",
+            params={"sesskey": sesskey},
+            json=payload,
+            headers={"Referer": f"{LEARNUS_URL}/my/",
+                     "X-Requested-With": "XMLHttpRequest"},
+            timeout=30,
+        )
+        data = resp.json()
+        result = data[0]
+        if not result.get("error"):
+            courses = {str(c["id"]): c["fullname"]
+                       for c in result["data"]["courses"]}
+            print(f"수강 과목 {len(courses)}개 (AJAX): {list(courses.values())[:5]}")
+            if courses:
+                return courses
+        exc = result.get("exception", {})
+        print(f"수강 과목 AJAX 실패: {exc.get('message') or exc.get('errorcode')}")
+    except Exception as e:
+        print(f"수강 과목 AJAX 예외: {e}")
+
+    # 방법 B: HTML 스크래핑 폴백
+    return _get_course_ids(session)
 
 
 def _get_course_ids(session: requests.Session) -> dict[str, str]:
