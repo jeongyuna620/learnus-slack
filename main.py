@@ -64,34 +64,41 @@ def login(username: str, password: str) -> requests.Session:
 def get_course_ids(session: requests.Session) -> list[str]:
     ids: set[str] = set()
 
-    # 시도할 페이지 목록
-    pages = [
-        f"{LEARNUS_URL}/my/",
-        f"{LEARNUS_URL}/course/index.php",
-    ]
+    resp = session.get(f"{LEARNUS_URL}/my/", timeout=30)
+    resp.raise_for_status()
+    html = resp.text
+    soup = BeautifulSoup(html, "html.parser")
 
-    for page_url in pages:
-        resp = session.get(page_url, timeout=30)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
+    # 방법 1: <script> 태그 안 JSON에서 course id 추출
+    for script in soup.find_all("script"):
+        text = script.string or ""
+        # "courseid":12345 또는 "id":12345 (courses 배열 안)
+        for m in re.finditer(r'"(?:course)?[Ii]d"\s*:\s*(\d{4,6})', text):
+            ids.add(m.group(1))
 
-        # 페이지 내 모든 링크에서 course id 추출
-        all_hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
-        course_hrefs = [h for h in all_hrefs if "course" in h and "id=" in h]
+    # 방법 2: 페이지 전체 HTML에서 course/view.php?id= 패턴 추출
+    for m in re.finditer(r'course/view\.php[^"\']*[?&]id=(\d+)', html):
+        ids.add(m.group(1))
 
-        # 디버그: 링크 샘플 출력
-        print(f"[{page_url}] 전체 링크 {len(all_hrefs)}개, course 관련 {len(course_hrefs)}개")
-        for h in course_hrefs[:10]:
-            print(f"  {h}")
+    # 방법 3: mycourses 필터 파라미터로 재시도
+    if not ids:
+        resp2 = session.get(f"{LEARNUS_URL}/course/index.php",
+                            params={"mycourses": 1}, timeout=30)
+        html2 = resp2.text
+        for m in re.finditer(r'course/view\.php[^"\']*[?&]id=(\d+)', html2):
+            ids.add(m.group(1))
 
-        for href in all_hrefs:
-            # /course/view.php?id=123 또는 유사 패턴
-            m = re.search(r"/course/view\.php[^\"']*[?&]id=(\d+)", href)
-            if m:
-                ids.add(m.group(1))
+    # 방법 4: 사용자 프로필 페이지에서 수강 과목 추출
+    if not ids:
+        resp3 = session.get(f"{LEARNUS_URL}/user/profile.php", timeout=30)
+        html3 = resp3.text
+        for m in re.finditer(r'course/view\.php[^"\']*[?&]id=(\d+)', html3):
+            ids.add(m.group(1))
 
-    print(f"수강 과목 {len(ids)}개 발견: {sorted(ids)}")
-    return sorted(ids)
+    # 숫자가 너무 작으면(시스템 ID) 제외, 너무 많으면 상위 50개만
+    ids = {i for i in ids if int(i) > 100}
+    print(f"수강 과목 {len(ids)}개 발견: {sorted(ids)[:20]}")
+    return sorted(ids)[:50]
 
 
 # ──────────────────────────────────────────────
