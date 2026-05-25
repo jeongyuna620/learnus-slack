@@ -513,11 +513,15 @@ def main() -> None:
     events = get_upcoming_events(session, sesskey)
 
     print(f"\n[전체 이벤트 - {len(events)}개]")
-    for e in events:
+    for i, e in enumerate(events):
         dl   = datetime.fromtimestamp(e["timesort"], tz=KST)
         diff = (dl.date() - today).days
         print(f"  D{diff:+d} | {dl.strftime('%m/%d %H:%M')} | "
               f"{e.get('modulename','?'):8s} | {e['name']}")
+        if i == 0:  # 첫 번째 이벤트의 전체 키 출력 (디버그)
+            print(f"  [debug] 이벤트 키: {list(e.keys())}")
+            print(f"  [debug] activityname={e.get('activityname')} | "
+                  f"description={str(e.get('description',''))[:60]}")
 
     days_to_check = [0, 1, 3] if now.hour < 18 else [0]
     events_by_days: dict[int, list] = {d: [] for d in days_to_check}
