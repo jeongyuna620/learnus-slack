@@ -99,7 +99,7 @@ def get_upcoming_events(session: requests.Session, sesskey: str) -> list:
         ajax_events = _scrape_course_events(session, dt_from, dt_to)
 
     # 방법 2: 강의 페이지 스크래핑 — 동영상(VOD) 마감일 추가
-    courses = _get_enrolled_courses(session, sesskey)
+    courses = _get_enrolled_courses(session, sesskey, ajax_events)
     vod_events = _get_vod_events(session, courses, dt_from, dt_to) if courses else []
 
     # AJAX 이벤트 URL 키 집합 (중복 방지)
@@ -111,37 +111,76 @@ def get_upcoming_events(session: requests.Session, sesskey: str) -> list:
     return all_events
 
 
-def _get_enrolled_courses(session: requests.Session, sesskey: str) -> dict[str, str]:
-    """수강 과목 목록 반환 {course_id: fullname}.
-    AJAX API 우선, 실패 시 HTML 스크래핑으로 폴백."""
-    # 방법 A: Moodle AJAX — core_course_get_enrolled_courses_by_timeline_classification
+def _get_user_id(session: requests.Session) -> str | None:
+    """현재 로그인 사용자의 Moodle user ID 추출."""
     try:
-        payload = [{"index": 0,
-                    "methodname": "core_course_get_enrolled_courses_by_timeline_classification",
-                    "args": {"offset": 0, "limit": 0, "classification": "all",
-                             "sort": "fullname", "customfieldname": "", "customfieldvalue": ""}}]
-        resp = session.post(
-            f"{LEARNUS_URL}/lib/ajax/service.php",
-            params={"sesskey": sesskey},
-            json=payload,
-            headers={"Referer": f"{LEARNUS_URL}/my/",
-                     "X-Requested-With": "XMLHttpRequest"},
-            timeout=30,
-        )
-        data = resp.json()
-        result = data[0]
-        if not result.get("error"):
-            courses = {str(c["id"]): c["fullname"]
-                       for c in result["data"]["courses"]}
-            print(f"수강 과목 {len(courses)}개 (AJAX): {list(courses.values())[:5]}")
-            if courses:
-                return courses
-        exc = result.get("exception", {})
-        print(f"수강 과목 AJAX 실패: {exc.get('message') or exc.get('errorcode')}")
-    except Exception as e:
-        print(f"수강 과목 AJAX 예외: {e}")
+        resp = session.get(f"{LEARNUS_URL}/my/", timeout=30)
+        # JS 설정 객체: "userid":12345
+        m = re.search(r'"userid"\s*:\s*(\d+)', resp.text)
+        if m:
+            return m.group(1)
+        # 프로필 링크: user/view.php?id=12345
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for a in soup.find_all("a", href=re.compile(r"user/view\.php")):
+            m = re.search(r"\bid=(\d+)", a["href"])
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return None
 
-    # 방법 B: HTML 스크래핑 폴백
+
+def _get_enrolled_courses(session: requests.Session, sesskey: str,
+                          ajax_events: list | None = None) -> dict[str, str]:
+    """수강 과목 목록 반환 {course_id: fullname}. 세 단계 폴백."""
+
+    # ── 방법 A: core_enrol_get_users_courses AJAX ──────────────────
+    userid = _get_user_id(session)
+    print(f"user ID: {userid}")
+    if userid:
+        try:
+            payload = [{"index": 0,
+                        "methodname": "core_enrol_get_users_courses",
+                        "args": {"userid": int(userid)}}]
+            resp = session.post(
+                f"{LEARNUS_URL}/lib/ajax/service.php",
+                params={"sesskey": sesskey},
+                json=payload,
+                headers={"Referer": f"{LEARNUS_URL}/my/",
+                         "X-Requested-With": "XMLHttpRequest"},
+                timeout=30,
+            )
+            data = resp.json()
+            if isinstance(data, list) and data and not data[0].get("error"):
+                raw = data[0].get("data", [])
+                courses = {str(c["id"]): c["fullname"] for c in raw
+                           if c.get("id") and int(c["id"]) > 10}
+                print(f"수강 과목 {len(courses)}개 (enrol AJAX): "
+                      f"{list(courses.values())[:5]}")
+                if courses:
+                    return courses
+            else:
+                err = (data[0].get("exception", {}) if isinstance(data, list) and data
+                       else data)
+                print(f"enrol AJAX 실패: {err}")
+        except Exception as e:
+            print(f"enrol AJAX 예외: {e}")
+
+    # ── 방법 B: 이미 받은 캘린더 이벤트에서 과목 ID 추출 ───────────
+    if ajax_events:
+        courses: dict[str, str] = {}
+        for ev in ajax_events:
+            c = ev.get("course", {})
+            cid = str(c.get("id", ""))
+            cname = c.get("fullname", "")
+            if cid and cid.isdigit() and int(cid) > 10 and cname:
+                courses[cid] = cname
+        if courses:
+            print(f"수강 과목 {len(courses)}개 (이벤트 추출): "
+                  f"{list(courses.values())[:5]}")
+            return courses
+
+    # ── 방법 C: HTML 스크래핑 폴백 ────────────────────────────────
     return _get_course_ids(session)
 
 
