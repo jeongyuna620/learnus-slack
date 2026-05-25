@@ -57,46 +57,45 @@ def login(username: str, password: str) -> requests.Session:
 # 수강 과목 ID 수집
 # ──────────────────────────────────────────────
 
+def debug_page(label: str, resp: requests.Response) -> None:
+    soup = BeautifulSoup(resp.text, "html.parser")
+    title = soup.find("title")
+    all_links = [a.get("href", "") for a in soup.find_all("a", href=True)]
+    print(f"[{label}] 최종URL={resp.url} | status={resp.status_code} | "
+          f"title={title.get_text(strip=True)[:60] if title else 'N/A'} | "
+          f"링크수={len(all_links)}")
+    # 링크 샘플 (course/grade/mod 관련)
+    samples = [h for h in all_links if any(k in h for k in ("course", "grade", "mod", "assign", "quiz"))]
+    for h in samples[:10]:
+        print(f"  → {h}")
+    if not samples:
+        print(f"  (관련 링크 없음, 전체 샘플: {all_links[:5]})")
+
+
 def get_course_ids(session: requests.Session) -> list[str]:
     ids: set[str] = set()
 
-    # 방법 1: 성적 개요 페이지 (서버사이드 렌더링, 항상 존재)
-    try:
-        resp = session.get(f"{LEARNUS_URL}/grade/overview/index.php", timeout=30)
-        html = resp.text
-        # /grade/report/user/index.php?id=X 또는 /course/view.php?id=X
-        for m in re.finditer(r'["\'](?:[^"\']*)/(?:grade/report/user/index|course/view)\.php[^"\']*[?&]id=(\d+)', html):
-            ids.add(m.group(1))
-        print(f"성적 페이지에서 {len(ids)}개 과목 발견")
-    except Exception as e:
-        print(f"성적 페이지 실패: {e}")
+    pages = [
+        ("성적 개요", f"{LEARNUS_URL}/grade/overview/index.php", {}),
+        ("내 강좌", f"{LEARNUS_URL}/course/index.php", {"mycourses": 1}),
+        ("프로필", f"{LEARNUS_URL}/user/profile.php", {}),
+        ("대시보드", f"{LEARNUS_URL}/my/", {}),
+    ]
 
-    # 방법 2: 내 강좌 페이지
-    if not ids:
+    for label, url, params in pages:
         try:
-            resp = session.get(f"{LEARNUS_URL}/course/index.php",
-                               params={"mycourses": 1}, timeout=30)
-            for m in re.finditer(r'course/view\.php[^"\']*[?&]id=(\d+)', resp.text):
+            resp = session.get(url, params=params, timeout=30)
+            debug_page(label, resp)
+            for m in re.finditer(r'course/view\.php[^"\'<>\s]*[?&]id=(\d+)', resp.text):
                 ids.add(m.group(1))
-            print(f"강좌 목록 페이지에서 {len(ids)}개 과목 발견")
-        except Exception as e:
-            print(f"강좌 목록 실패: {e}")
-
-    # 방법 3: 프로필 페이지
-    if not ids:
-        try:
-            resp = session.get(f"{LEARNUS_URL}/user/profile.php", timeout=30)
-            for m in re.finditer(r'course/view\.php[^"\']*[?&]id=(\d+)', resp.text):
+            for m in re.finditer(r'grade/report/user/index\.php[^"\'<>\s]*[?&]id=(\d+)', resp.text):
                 ids.add(m.group(1))
-            print(f"프로필 페이지에서 {len(ids)}개 과목 발견")
         except Exception as e:
-            print(f"프로필 페이지 실패: {e}")
+            print(f"[{label}] 실패: {e}")
 
-    # id가 너무 작으면(시스템 과목) 제외
     ids = {i for i in ids if int(i) > 10}
-    result = sorted(ids)
-    print(f"최종 수강 과목: {result}")
-    return result
+    print(f"최종 수강 과목: {sorted(ids)}")
+    return sorted(ids)
 
 
 # ──────────────────────────────────────────────
