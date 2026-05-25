@@ -34,23 +34,53 @@ def login(username: str, password: str) -> requests.Session:
         ),
         "Accept-Language": "ko-KR,ko;q=0.9",
     })
-    resp = session.get(f"{LEARNUS_URL}/login/index.php", timeout=30)
-    resp.raise_for_status()
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    token_el = soup.find("input", {"name": "logintoken"})
-    logintoken = token_el["value"] if token_el else ""
+    # 로그인 페이지 로드 (login.php → login/index.php 순 시도)
+    for login_path in ["/login.php", "/login/index.php"]:
+        resp = session.get(f"{LEARNUS_URL}{login_path}", timeout=30)
+        print(f"GET {login_path} → 최종URL: {resp.url}")
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-    resp = session.post(
-        f"{LEARNUS_URL}/login/index.php",
-        data={"username": username, "password": password,
-              "logintoken": logintoken, "anchor": ""},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    if "loginerrormessage" in resp.text:
-        raise RuntimeError("로그인 실패: 아이디/비밀번호 확인")
-    return session
+        # 폼에서 입력 필드 수집
+        form = soup.find("form")
+        if not form:
+            continue
+
+        form_data: dict = {}
+        for inp in form.find_all("input"):
+            name = inp.get("name")
+            if name:
+                form_data[name] = inp.get("value", "")
+
+        print(f"  폼 필드: {list(form_data.keys())}")
+
+        # 아이디/비밀번호 삽입
+        for ufield in ["username", "id", "loginid", "userid"]:
+            if ufield in form_data:
+                form_data[ufield] = username
+                break
+        for pfield in ["password", "passwd", "pw"]:
+            if pfield in form_data:
+                form_data[pfield] = password
+                break
+
+        action = form.get("action", resp.url)
+        if action and not action.startswith("http"):
+            action = LEARNUS_URL + action
+
+        print(f"  POST → {action}")
+        resp = session.post(action, data=form_data, timeout=30)
+        print(f"  로그인 후 URL: {resp.url}")
+        print(f"  쿠키: {list(session.cookies.keys())}")
+
+        # 로그인 성공 판단: login 페이지가 아니면 성공
+        if "login" not in resp.url.lower() and "error" not in resp.url.lower():
+            print("로그인 성공")
+            return session
+
+        print(f"  → 로그인 실패, 다음 방법 시도")
+
+    raise RuntimeError("모든 로그인 방법 실패 — SSO 흐름 확인 필요")
 
 
 # ──────────────────────────────────────────────
