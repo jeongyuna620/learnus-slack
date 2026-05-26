@@ -77,7 +77,7 @@ LearnUS 세션은 일정 시간이 지나면 만료됩니다.
 
 이 알림을 받으면 **3단계 → 4단계**를 반복해서 `LEARNUS_SESSION` Secret을 새 값으로 업데이트하면 됩니다.
 
-> 세션 자동 유지를 위해 **LearnUs Session Keep-Alive** 워크플로우가 6시간마다 ping을 보냅니다.  
+> 세션 자동 유지를 위해 **LearnUs Session Keep-Alive** 워크플로우가 2시간마다 ping을 보냅니다.  
 > 하지만 LearnUS 서버 정책에 따라 세션이 만료될 수 있으므로 만료 알림을 받으면 수동으로 갱신해주세요.
 
 ---
@@ -87,7 +87,7 @@ LearnUS 세션은 일정 시간이 지나면 만료됩니다.
 ```
 .github/workflows/
 ├── notify.yml      # 매일 9시 / 21시 마감 알림 실행
-└── keepalive.yml   # 매 6시간 세션 유지 ping
+└── keepalive.yml   # 매 2시간 세션 유지 ping
 ```
 
 ---
