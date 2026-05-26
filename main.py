@@ -564,7 +564,7 @@ def main() -> None:
             print(f"  [debug] activityname={e.get('activityname')} | "
                   f"description={str(e.get('description',''))[:60]}")
 
-    days_to_check = [0, 1, 3] if now.hour < 18 else [0]
+    days_to_check = [0, 1, 3] if now.hour < 21 else [0]
     events_by_days: dict[int, list] = {d: [] for d in days_to_check}
     for e in events:
         dl   = datetime.fromtimestamp(e["timesort"], tz=KST)
