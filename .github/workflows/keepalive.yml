@@ -2,7 +2,7 @@ name: LearnUs Session Keep-Alive
 
 on:
   schedule:
-    - cron: '0 * * * *'  # 매시간 실행 (세션 타임아웃 방지)
+    - cron: '0 */2 * * *'  # 2시간마다 실행 (세션 타임아웃 방지)
   workflow_dispatch:
 
 jobs:
